@@ -40,12 +40,24 @@ add_library(ceio_core
   src/hw/cache.cpp
   src/hw/dram.cpp
   src/hw/memory_system.cpp
-  src/hw/pcie.cpp)
+  src/hw/pcie.cpp
+  src/net/traffic.cpp
+  src/net/link.cpp
+  src/host/address_space.cpp
+  src/host/buffer_pool.cpp
+  src/host/app.cpp
+  src/host/core.cpp
+  src/nic/nic.cpp
+  src/exp/scenario.cpp
+  src/exp/experiment.cpp)
 add_library(ceio::core ALIAS ceio_core)
 target_include_directories(ceio_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_link_libraries(ceio_core PRIVATE ceio_options)
 set_target_properties(ceio_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_executable(ceio_run tools/ceio_run.cpp)
+target_link_libraries(ceio_run PRIVATE ceio::core ceio_options)
 
 # ---------------------------------------------------------------------------
 # Tests

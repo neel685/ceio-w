@@ -28,6 +28,9 @@ class MemorySystem {
   Tick cpu_read(Tick now, std::uint64_t addr, std::uint64_t bytes);
   /// CPU writes [addr, addr+bytes) (write-allocate). Returns when all lines are owned.
   Tick cpu_write(Tick now, std::uint64_t addr, std::uint64_t bytes);
+  /// Non-blocking store: same cache/DRAM effects as cpu_write(), but the core only
+  /// pays the issue time (the store buffer hides the RFO latency).
+  Tick cpu_store(Tick now, std::uint64_t addr, std::uint64_t bytes);
 
   /// IIO commits one inbound DMA line. Returns when the IIO may start the next line
   /// (includes waiting for DRAM to accept a writeback forced by the allocation).

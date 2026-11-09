@@ -60,6 +60,10 @@ class PcieHost {
   std::uint64_t queued_write_bytes() const { return queued_bytes_; }
   const TimeWeighted& iio_occupancy() const { return iio_occ_; }
   const PcieStats& stats() const { return stats_; }
+  void reset_stats() {
+    stats_ = {};
+    iio_occ_ = TimeWeighted(sim_.now(), static_cast<double>(iio_bytes_));
+  }
   const PcieConfig& config() const { return cfg_; }
 
  private:

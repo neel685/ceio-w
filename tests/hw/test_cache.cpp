@@ -13,7 +13,7 @@ CacheConfig make(std::uint64_t sets, std::uint32_t ways, std::uint32_t ddio, boo
   c.ddio_ways = ddio;
   c.line_bytes = 64;
   c.size_bytes = sets * ways * 64;
-  c.hash_index = hash;
+  c.index = hash ? CacheConfig::Index::kHash : CacheConfig::Index::kModulo;
   return c;
 }
 
@@ -198,6 +198,32 @@ TEST(CacheEmergent, LeakyDmaAppearsWhenBacklogExceedsDdio) {
   const auto [leaky_big, miss_big] = run(4096);  // twice the DDIO capacity
   EXPECT_GT(leaky_big, 60'000u);
   EXPECT_GT(miss_big, 60'000u);
+}
+
+TEST(CacheEmergent, SlicedIndexMakesSmallPacketsUseWholeBuffers) {
+  // [Toasty] Sec. 2: "DDIO ways can hold >= 1536 buffers" = 6 MB / 4 KB, even though
+  // a 512 B packet fills only 8 lines. With Intel-style indexing, the set inside a
+  // slice comes from low address bits, so the first 8 lines of every 4 KB buffer
+  // compete for 1/8 of the sets. Uniform hashing would hide this.
+  auto hit_rate = [](CacheConfig::Index idx, std::uint32_t buffers) {
+    CacheConfig c;
+    c.size_bytes = 45ULL << 20;
+    c.ways = 15;
+    c.ddio_ways = 2;
+    c.slices = 24;
+    c.index = idx;
+    SetAssocCache cache(c);
+    for (int pass = 0; pass < 3; ++pass) {
+      if (pass == 2) cache.reset_stats();
+      for (std::uint64_t b = 0; b < buffers; ++b)
+        for (std::uint64_t l = 0; l < 8; ++l) cache.io_write(b * 64 + l);  // 4 KB stride, 512 B used
+    }
+    return cache.stats().io_write_hit_rate();
+  };
+  // 4096 buffers x 512 B = 2 MB, far below the 6 MB of DDIO ways.
+  EXPECT_GT(hit_rate(CacheConfig::Index::kHash, 4096), 0.8);  // random 2-way conflicts
+  EXPECT_LT(hit_rate(CacheConfig::Index::kSliced, 4096), 0.2);
+  EXPECT_GT(hit_rate(CacheConfig::Index::kSliced, 512), 0.8);
 }
 
 TEST(CacheEmergent, ConsumedLinesCompeteWithUnreadOnes) {

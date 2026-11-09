@@ -46,6 +46,11 @@ Tick MemorySystem::cpu_write(Tick now, std::uint64_t addr, std::uint64_t bytes) 
   return cpu_access(now, addr, bytes, true);
 }
 
+Tick MemorySystem::cpu_store(Tick now, std::uint64_t addr, std::uint64_t bytes) {
+  cpu_access(now, addr, bytes, true);
+  return now + lines_of(addr, bytes, line_bytes()).count * timing_.cpu_issue_gap;
+}
+
 Tick MemorySystem::io_write_line(Tick now, std::uint64_t line) {
   const CacheAccess acc = cache_.io_write(line);
   Tick t = now + (acc.hit ? timing_.io_write_update : timing_.io_write_alloc);

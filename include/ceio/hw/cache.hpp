@@ -19,11 +19,19 @@ struct CacheConfig {
   std::uint32_t line_bytes = 64;
   /// Number of ways I/O (DDIO) writes may allocate into (the highest-numbered ways).
   std::uint32_t ddio_ways = 6;
-  /// If true, set index = hash(line) % sets (models sliced-LLC hashing);
-  /// if false, set index = line % sets (analytical tests).
-  bool hash_index = true;
+  enum class Index {
+    /// Intel-style: slice = hash(line) % slices, set within slice = line % sets_per_slice.
+    /// Low address bits pick the set directly, so buffers whose packets only fill the
+    /// first lines of each page alias onto a fraction of the sets.
+    kSliced,
+    kHash,    ///< set = hash(line) % sets (idealised uniform spreading)
+    kModulo,  ///< set = line % sets (analytical tests)
+  };
+  Index index = Index::kSliced;
+  std::uint32_t slices = 8;
 
   std::uint64_t sets() const { return size_bytes / (static_cast<std::uint64_t>(ways) * line_bytes); }
+  std::uint64_t sets_per_slice() const { return sets() / slices; }
   std::uint64_t ddio_bytes() const { return sets() * ddio_ways * line_bytes; }
   void validate() const;  ///< throws std::invalid_argument on inconsistent values
 };

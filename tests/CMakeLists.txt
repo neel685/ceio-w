@@ -16,7 +16,11 @@ add_executable(ceio_tests
   hw/test_cache.cpp
   hw/test_dram.cpp
   hw/test_memory_system.cpp
-  hw/test_pcie.cpp)
+  hw/test_pcie.cpp
+  net/test_net.cpp
+  host/test_host.cpp
+  nic/test_nic.cpp
+  exp/test_experiment.cpp)
 target_link_libraries(ceio_tests PRIVATE ceio::core ceio_options GTest::gtest_main)
 
 include(GoogleTest)

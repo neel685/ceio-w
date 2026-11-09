@@ -21,6 +21,8 @@ void CacheConfig::validate() const {
     throw std::invalid_argument("CacheConfig: ddio_ways must be in [1, ways]");
   if (size_bytes % (static_cast<std::uint64_t>(ways) * line_bytes) != 0 || sets() == 0)
     throw std::invalid_argument("CacheConfig: size_bytes must be a positive multiple of ways*line_bytes");
+  if (index == Index::kSliced && (slices == 0 || sets() % slices != 0))
+    throw std::invalid_argument("CacheConfig: sets must be divisible by slices");
 }
 
 double CacheStats::io_write_hit_rate() const {
@@ -40,7 +42,17 @@ SetAssocCache::SetAssocCache(const CacheConfig& cfg) : cfg_(cfg) {
 }
 
 std::uint64_t SetAssocCache::set_of(std::uint64_t line) const {
-  return (cfg_.hash_index ? mix64(line) : line) % sets_;
+  switch (cfg_.index) {
+    case CacheConfig::Index::kSliced: {
+      const std::uint64_t per = sets_ / cfg_.slices;
+      return (mix64(line) % cfg_.slices) * per + line % per;
+    }
+    case CacheConfig::Index::kHash:
+      return mix64(line) % sets_;
+    case CacheConfig::Index::kModulo:
+      break;
+  }
+  return line % sets_;
 }
 
 SetAssocCache::Way* SetAssocCache::find(std::uint64_t line, std::uint32_t* way_out) {

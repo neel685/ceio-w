@@ -12,6 +12,7 @@ CacheConfig cache_cfg(std::uint64_t sets = 1024, std::uint32_t ways = 12, std::u
   c.ways = ways;
   c.ddio_ways = ddio;
   c.size_bytes = sets * ways * 64;
+  if (sets < c.slices) c.index = CacheConfig::Index::kModulo;
   return c;
 }
 
