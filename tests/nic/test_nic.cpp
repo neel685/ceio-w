@@ -145,9 +145,11 @@ TEST(Nic, SteeringActions) {
 TEST(Nic, DeliverToHostBypassesSteeringAndOnChipBuffer) {
   Rig r;
   const QueueId q = r.desc_queue();
-  EXPECT_THROW(r.nic.deliver_to_host(pkt(0), q), std::logic_error);
+  r.nic.deliver_to_host(pkt(0), q);  // no descriptor yet: waits in order
+  r.sim.run();
+  EXPECT_EQ(r.nic.queue(q).completions().size(), 0u);
+  EXPECT_EQ(r.nic.rx_buffer_used(), 0u);  // not counted against the on-chip buffer
   r.nic.post_buffers(q, {0x200000});
-  r.nic.deliver_to_host(pkt(0), q);
   r.sim.run();
   EXPECT_EQ(r.nic.queue(q).completions().size(), 1u);
   EXPECT_EQ(r.nic.rule(1)->hits, 0u);

@@ -44,12 +44,15 @@ void CpuCore::start() {
 }
 
 void CpuCore::wake() {
-  if (!idle_ || wake_pending_) return;
+  if (!(idle_ || waiting_ext_) || wake_pending_) return;
   wake_pending_ = true;
   sim_.schedule_in(cfg_.wake_latency, [this] {
     wake_pending_ = false;
-    idle_ = false;
-    busy_since_ = sim_.now();
+    waiting_ext_ = false;
+    if (idle_) {
+      idle_ = false;
+      busy_since_ = sim_.now();
+    }
     poll();
   });
 }
@@ -63,7 +66,14 @@ void CpuCore::go_idle() {
 void CpuCore::poll() {
   ++stats_.polls;
   auto& cq = nic_.queue(queue_).completions();
-  if (cq.empty()) return go_idle();
+  const auto action = ext_ ? ext_->on_poll(*this, cq.size()) : RxExtension::PollAction::kNone;
+  if (cq.empty()) {
+    if (action == RxExtension::PollAction::kWait) {
+      waiting_ext_ = true;  // blocking recv(): spin until the fetched data lands
+      return;
+    }
+    return go_idle();
+  }
   const std::size_t n = std::min<std::size_t>(cfg_.batch, cq.size());
   for (std::size_t i = 0; i < n; ++i) {
     batch_.push_back(cq.front());
@@ -74,6 +84,7 @@ void CpuCore::poll() {
 
 void CpuCore::next() {
   if (batch_.empty()) {
+    if (ext_) ext_->on_batch_end(*this);
     const Tick t = refill(sim_.now());
     sim_.schedule_at(t, [this] { poll(); });
     return;
@@ -135,6 +146,7 @@ void CpuCore::finish(const nic::RxCompletion& c, std::optional<std::uint64_t> tx
   ++stats_.packets;
   stats_.bytes += c.bytes;
   if (on_done_) on_done_(c, sim_.now());
+  if (ext_) ext_->on_processed(*this, c);
   if (app_.per_message || !pool_) return;
 
   switch (app_.reply) {

@@ -20,6 +20,8 @@ add_executable(ceio_tests
   net/test_net.cpp
   host/test_host.cpp
   nic/test_nic.cpp
+  policy/test_credit_manager.cpp
+  policy/test_ceio.cpp
   exp/test_experiment.cpp)
 target_link_libraries(ceio_tests PRIVATE ceio::core ceio_options GTest::gtest_main)
 

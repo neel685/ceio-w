@@ -26,7 +26,9 @@ LatencySummary summarize(const Histogram& h) {
 }
 
 struct FlowAcc {
-  std::uint64_t sent = 0, delivered = 0, bytes = 0, drop_sw = 0, drop_nic = 0;
+  std::uint64_t sent = 0, delivered = 0, bytes = 0, drop_sw = 0, drop_nic = 0, reordered = 0;
+  bool seen = false;
+  std::uint64_t last = 0;  // highest seq (or RDMA message id) delivered so far
   Histogram latency;
 };
 
@@ -76,10 +78,15 @@ Results run(const Scenario& s) {
                                                     root.derive("core" + std::to_string(i)), table, desc,
                                                     s.link.rate_gbps));
     cores.back()->set_done_hook([&, rdma = q.kind == nic::QueueKind::kRdma](const nic::RxCompletion& c, Tick done) {
-      if (!measuring) return;
       auto it = flow_index.find(c.pkt.flow);
       if (it == flow_index.end()) return;
       FlowAcc& a = acc[it->second];
+      const std::uint64_t order = rdma ? c.pkt.msg_id : c.pkt.seq;
+      const bool late = a.seen && order < a.last;
+      a.last = a.seen ? std::max(a.last, order) : order;
+      a.seen = true;
+      if (!measuring) return;
+      if (late) ++a.reordered;
       a.delivered += rdma ? c.pkt.msg_pkts : 1;
       a.bytes += c.bytes;
       a.latency.record(done - c.pkt.sent);
@@ -108,6 +115,29 @@ Results run(const Scenario& s) {
         }));
   }
 
+  // I/O policy.
+  std::unique_ptr<policy::CeioController> ceio;
+  std::int64_t total_credits = 0;
+  if (s.policy == IoPolicy::kCeio) {
+    total_credits = s.ceio.total_credits;
+    if (total_credits == 0) {
+      std::uint32_t buf = 2048;
+      for (const auto& q : s.queues)
+        if (q.kind == nic::QueueKind::kDescriptor) {
+          buf = q.buffer_bytes;
+          break;
+        }
+      total_credits = static_cast<std::int64_t>(s.cache.ddio_bytes() / buf);  // [CEIO] Eq. (1)
+    }
+    std::vector<policy::CeioFlowInfo> infos;
+    for (const auto& f : s.flows)
+      infos.push_back({f.spec.id, cores[f.queue]->queue(), s.queues[f.queue].kind == nic::QueueKind::kRdma,
+                       f.spec.start});
+    ceio = std::make_unique<policy::CeioController>(sim, nic, s.ceio, infos, total_credits);
+    for (auto& c : cores) c->set_extension(ceio.get());
+    ceio->start();
+  }
+
   std::unique_ptr<host::MemoryHog> hog;
   if (s.pressure.gbytes_per_s > 0) {
     const std::uint64_t base = as.allocate("hog", s.pressure.region_bytes, 2ULL << 20);
@@ -128,6 +158,7 @@ Results run(const Scenario& s) {
       port.reset_stats();
       nic.reset_stats();
       for (auto& c : cores) c->reset_stats();
+      if (ceio) ceio->reset_stats();
     });
   }
   const Tick end = s.warmup + s.measure;
@@ -150,6 +181,9 @@ Results run(const Scenario& s) {
     f.delivered_bytes = a.bytes;
     f.drops_switch = a.drop_sw;
     f.drops_nic = a.drop_nic;
+    f.reordered = a.reordered;
+    if (ceio) f.slow_packets = ceio->slow_packets(f.id);
+    r.reordered += a.reordered;
     f.goodput_gbps = static_cast<double>(a.bytes) * 8 / secs / 1e9;
     f.mpps = static_cast<double>(a.delivered) / secs / 1e6;
     f.latency = summarize(a.latency);
@@ -164,6 +198,12 @@ Results run(const Scenario& s) {
   }
   r.latency = summarize(all);
   r.ecn_marked = port.stats().ecn_marked;
+  if (ceio) {
+    r.policy = "ceio";
+    r.ceio = ceio->stats();
+    r.ceio_total_credits = total_credits;
+    r.ceio_credits_conserved = ceio->credits().invariant_ok();
+  }
 
   r.cache = mem.cache().stats();
   r.io_write_hit_rate = r.cache.io_write_hit_rate();
@@ -308,8 +348,29 @@ std::string to_json(const Results& r) {
       .kv("delivered_packets", r.delivered_packets)
       .kv("drops_switch", r.drops_switch)
       .kv("drops_nic", r.drops_nic)
-      .kv("ecn_marked", r.ecn_marked);
+      .kv("ecn_marked", r.ecn_marked)
+      .kv("reordered", r.reordered)
+      .kv("policy", r.policy);
   latency_json(j, "latency", r.latency);
+  if (r.policy == "ceio") {
+    j.open("ceio")
+        .kv("total_credits", r.ceio_total_credits)
+        .kv("fast_packets", r.ceio.fast_packets)
+        .kv("slow_packets", r.ceio.slow_packets)
+        .kv("to_slow", r.ceio.to_slow)
+        .kv("to_fast", r.ceio.to_fast)
+        .kv("drain_requests", r.ceio.drain_requests)
+        .kv("drained_packets", r.ceio.drained_packets)
+        .kv("upgraded_packets", r.ceio.upgraded_packets)
+        .kv("held_packets", r.ceio.held_packets)
+        .kv("nic_mem_drops", r.ceio.nic_mem_drops)
+        .kv("nic_mem_max_bytes", r.ceio.nic_mem_max_bytes)
+        .kv("cc_signals", r.ceio.cc_signals)
+        .kv("deactivations", r.ceio.deactivations)
+        .kv("reactivations", r.ceio.reactivations)
+        .kv("min_credit_balance", r.ceio.min_credit_balance)
+        .close();
+  }
   j.open("cache")
       .kv("io_write_hit_rate", r.io_write_hit_rate)
       .kv("cpu_read_hit_rate", r.cpu_read_hit_rate)
@@ -338,6 +399,8 @@ std::string to_json(const Results& r) {
         .kv("delivered_bytes", f.delivered_bytes)
         .kv("drops_switch", f.drops_switch)
         .kv("drops_nic", f.drops_nic)
+        .kv("slow_packets", f.slow_packets)
+        .kv("reordered", f.reordered)
         .kv("goodput_gbps", f.goodput_gbps)
         .kv("mpps", f.mpps);
     latency_json(j, "latency", f.latency);

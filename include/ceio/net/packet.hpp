@@ -19,6 +19,7 @@ struct Packet {
   std::uint32_t msg_index = 0; ///< position within the message (0 = first)
   bool msg_last = true;        ///< last packet of its message
   bool ecn = false;            ///< CE-marked by the switch
+  bool slow = false;           ///< took CEIO's slow path (buffered in on-NIC memory)
   Tick sent = 0;               ///< when the sender emitted it
   Tick nic_arrival = 0;        ///< when the last bit reached the NIC
 };

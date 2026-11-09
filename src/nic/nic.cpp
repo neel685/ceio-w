@@ -47,6 +47,7 @@ void Nic::steer(net::Packet p) {
   SteeringRule* r = rule(p.flow);
   if (!r) return drop(p, stats_.drops_no_rule);
   ++r->hits;
+  if (steer_hook_) steer_hook_(p, *r);
   switch (r->action) {
     case SteerAction::kDrop:
       return drop(p, stats_.drops_rule);
@@ -65,7 +66,7 @@ void Nic::steer(net::Packet p) {
   buf_used_ += p.bytes;
   buf_occ_.set(sim_.now(), static_cast<double>(buf_used_));
   if (q.cfg_.kind == QueueKind::kRdma) return dma_rdma(q, p, true);
-  q.waiting_.push_back(p);
+  q.waiting_.push_back({p, true, {}});
   q.waiting_bytes_ += p.bytes;
   try_dispatch(q);
 }
@@ -78,10 +79,10 @@ void Nic::try_dispatch(RxQueue& q) {
     }
     const std::uint64_t buf = q.ring_.front();
     q.ring_.pop_front();
-    net::Packet p = q.waiting_.front();
+    RxQueue::Waiting w = std::move(q.waiting_.front());
     q.waiting_.pop_front();
-    q.waiting_bytes_ -= p.bytes;
-    dma_descriptor(q, p, buf, true);
+    if (w.on_chip) q.waiting_bytes_ -= w.p.bytes;
+    dma_descriptor(q, w.p, buf, w.on_chip, std::move(w.on_done));
   }
 }
 
@@ -95,13 +96,18 @@ void Nic::post_buffers(QueueId qid, const std::vector<std::uint64_t>& addrs) {
   try_dispatch(q);
 }
 
-void Nic::deliver_to_host(net::Packet p, QueueId qid) {
+void Nic::deliver_to_host(net::Packet p, QueueId qid, Callback on_dma_done) {
   RxQueue& q = queues_.at(qid);
-  if (q.cfg_.kind == QueueKind::kRdma) return dma_rdma(q, p, false);
-  if (q.ring_.empty()) throw std::logic_error("Nic::deliver_to_host: no posted descriptor");
-  const std::uint64_t buf = q.ring_.front();
-  q.ring_.pop_front();
-  dma_descriptor(q, p, buf, false);
+  if (q.cfg_.kind == QueueKind::kRdma) return dma_rdma(q, p, false, std::move(on_dma_done));
+  q.waiting_.push_back({p, false, std::move(on_dma_done)});
+  try_dispatch(q);
+}
+
+void Nic::deliver_to_buffer(net::Packet p, QueueId qid, std::uint64_t buf, Callback on_complete) {
+  RxQueue& q = queues_.at(qid);
+  if (q.cfg_.kind != QueueKind::kDescriptor)
+    throw std::logic_error("Nic::deliver_to_buffer: queue " + std::to_string(qid) + " is not a descriptor queue");
+  dma_descriptor(q, p, buf, false, std::move(on_complete));
 }
 
 std::uint64_t Nic::next_cqe(RxQueue& q) {
@@ -114,7 +120,7 @@ void Nic::release_on_chip(std::uint32_t bytes) {
   buf_occ_.set(sim_.now(), static_cast<double>(buf_used_));
 }
 
-void Nic::dma_descriptor(RxQueue& q, net::Packet p, std::uint64_t buf, bool on_chip) {
+void Nic::dma_descriptor(RxQueue& q, net::Packet p, std::uint64_t buf, bool on_chip, Callback on_complete) {
   ++q.stats_.dma_packets;
   ++q.dma_total_;
   const std::uint32_t bytes = p.bytes;
@@ -122,28 +128,36 @@ void Nic::dma_descriptor(RxQueue& q, net::Packet p, std::uint64_t buf, bool on_c
     if (on_chip) release_on_chip(bytes);
   });
   const std::uint64_t cqe = next_cqe(q);
-  pcie_.dma_write(cqe, cfg_.cqe_bytes, [this, qid = q.id_, p, buf, bytes, cqe] {
-    complete(queues_[qid], RxCompletion{p, buf, bytes, cqe, sim_.now()});
+  pcie_.dma_write(cqe, cfg_.cqe_bytes, [this, qid = q.id_, p, buf, bytes, cqe, cb = std::move(on_complete)] {
+    complete(queues_[qid], RxCompletion{p, buf, bytes, cqe, sim_.now(), p.slow, p.slow ? 0u : 1u});
+    if (cb) cb();
   });
 }
 
-void Nic::dma_rdma(RxQueue& q, net::Packet p, bool on_chip) {
+void Nic::dma_rdma(RxQueue& q, net::Packet p, bool on_chip, Callback on_dma_done) {
   ++q.stats_.dma_packets;
   ++q.dma_total_;
   const std::uint32_t bytes = p.bytes;
   if (q.mr_offset_ + bytes > q.cfg_.mr_bytes) q.mr_offset_ = 0;  // wrap the region
   const std::uint64_t addr = q.cfg_.mr_base + q.mr_offset_;
   q.mr_offset_ += bytes;
-  if (p.msg_index == 0 || !q.msg_start_.count(p.flow)) q.msg_start_[p.flow] = addr;
-  pcie_.dma_write(addr, bytes, [this, bytes, on_chip] {
+  if (p.msg_index == 0 || !q.msg_start_.count(p.flow)) {
+    q.msg_start_[p.flow] = addr;
+    q.msg_fast_[p.flow] = 0;
+  }
+  if (!p.slow) ++q.msg_fast_[p.flow];
+  pcie_.dma_write(addr, bytes, [this, bytes, on_chip, cb = std::move(on_dma_done)] {
     if (on_chip) release_on_chip(bytes);
+    if (cb) cb();
   });
   if (!p.msg_last) return;
   const std::uint64_t start = q.msg_start_[p.flow];
   const std::uint32_t msg_bytes = p.msg_pkts * bytes;
+  const std::uint32_t fast = q.msg_fast_[p.flow];
+  q.msg_fast_[p.flow] = 0;
   const std::uint64_t cqe = next_cqe(q);
-  pcie_.dma_write(cqe, cfg_.cqe_bytes, [this, qid = q.id_, p, start, msg_bytes, cqe] {
-    complete(queues_[qid], RxCompletion{p, start, msg_bytes, cqe, sim_.now()});
+  pcie_.dma_write(cqe, cfg_.cqe_bytes, [this, qid = q.id_, p, start, msg_bytes, cqe, fast] {
+    complete(queues_[qid], RxCompletion{p, start, msg_bytes, cqe, sim_.now(), p.slow, fast});
   });
 }
 

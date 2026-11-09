@@ -42,6 +42,8 @@ struct RxCompletion {
   std::uint32_t bytes = 0;      ///< packet bytes, or message bytes for RDMA
   std::uint64_t cqe_addr = 0;
   Tick completed = 0;           ///< when the CQE became visible in host memory
+  bool slow = false;            ///< delivered by a slow-path drain
+  std::uint32_t fast_pkts = 1;  ///< packets of this completion that held credits (fast path)
 };
 
 struct RxQueueStats {
@@ -66,6 +68,10 @@ class RxQueue {
   std::deque<RxCompletion>& completions() { return completions_; }
   /// Called (once per new completion) to wake a polling core.
   void set_notify(std::function<void()> fn) { notify_ = std::move(fn); }
+  /// Wakes the polling core without a completion (e.g. slow-path data is pending).
+  void poke() {
+    if (notify_) notify_();
+  }
   const RxQueueStats& stats() const { return stats_; }
   void reset_stats() { stats_ = {}; }
   /// Packets DMA'd since creation; never reset (drivers diff it per iteration).
@@ -77,12 +83,18 @@ class RxQueue {
   QueueId id_;
   RxQueueConfig cfg_;
   std::deque<std::uint64_t> ring_;        // posted buffer addresses, hardware FIFO
-  std::deque<net::Packet> waiting_;       // packets in NIC memory waiting for a descriptor
-  std::uint64_t waiting_bytes_ = 0;
+  struct Waiting {
+    net::Packet p;
+    bool on_chip;                  // occupies the shared on-chip buffer
+    std::function<void()> on_done; // completion callback (slow-path deliveries)
+  };
+  std::deque<Waiting> waiting_;           // packets waiting for a posted descriptor, in order
+  std::uint64_t waiting_bytes_ = 0;       // on-chip bytes among them
   std::deque<RxCompletion> completions_;
   std::uint64_t cq_index_ = 0;
   std::uint64_t mr_offset_ = 0;
   std::unordered_map<net::FlowId, std::uint64_t> msg_start_;  // RDMA: flow -> current message base
+  std::unordered_map<net::FlowId, std::uint32_t> msg_fast_;   // RDMA: fast-path packets in message
   std::function<void()> notify_;
   RxQueueStats stats_;
 };
@@ -129,6 +141,11 @@ class Nic {
   using DropHook = std::function<void(const net::Packet&)>;
   /// Handles packets steered with SteerAction::kNicMemory (installed by CEIO).
   using SlowPathHook = std::function<void(net::Packet, QueueId)>;
+  /// Runs for every matched packet after its hit counter is incremented and before
+  /// the action is applied; it may rewrite the rule (models the match-action stage
+  /// CEIO's flow controller reconfigures).
+  using SteerHook = std::function<void(const net::Packet&, SteeringRule&)>;
+  using Callback = std::function<void()>;
 
   Nic(Simulator& sim, hw::PcieHost& pcie, const NicConfig& cfg = {});
 
@@ -144,12 +161,18 @@ class Nic {
   void receive(net::Packet p);
   /// Descriptors arrive at the NIC (after the driver's doorbell).
   void post_buffers(QueueId q, const std::vector<std::uint64_t>& addrs);
-  /// DMAs `p` into the host for queue `q`, bypassing steering. Used by the slow
-  /// path to drain on-NIC memory; `p` does not occupy the on-chip buffer.
-  void deliver_to_host(net::Packet p, QueueId q);
+  /// DMAs `p` into the host for queue `q`, bypassing steering and the on-chip
+  /// buffer (descriptor queues: next posted buffer, queued in order behind other
+  /// waiting packets if none is posted; RDMA: the memory region). For descriptor
+  /// queues `on_dma_done` runs when the CQE is visible, for RDMA when data lands.
+  void deliver_to_host(net::Packet p, QueueId q, Callback on_dma_done = {});
+  /// Slow-path drain into a driver-supplied buffer of a descriptor queue; the
+  /// completion is flagged slow. `on_complete` runs when its CQE is visible.
+  void deliver_to_buffer(net::Packet p, QueueId q, std::uint64_t buf, Callback on_complete = {});
 
   void set_drop_hook(DropHook h) { on_drop_ = std::move(h); }
   void set_slow_path(SlowPathHook h) { slow_path_ = std::move(h); }
+  void set_steer_hook(SteerHook h) { steer_hook_ = std::move(h); }
 
   std::uint64_t rx_buffer_used() const { return buf_used_; }
   const TimeWeighted& rx_buffer_occupancy() const { return buf_occ_; }
@@ -162,8 +185,8 @@ class Nic {
   void steer(net::Packet p);
   void drop(const net::Packet& p, std::uint64_t& counter);
   void try_dispatch(RxQueue& q);
-  void dma_descriptor(RxQueue& q, net::Packet p, std::uint64_t buf, bool on_chip);
-  void dma_rdma(RxQueue& q, net::Packet p, bool on_chip);
+  void dma_descriptor(RxQueue& q, net::Packet p, std::uint64_t buf, bool on_chip, Callback on_complete = {});
+  void dma_rdma(RxQueue& q, net::Packet p, bool on_chip, Callback on_dma_done = {});
   std::uint64_t next_cqe(RxQueue& q);
   void complete(RxQueue& q, RxCompletion c);
   void release_on_chip(std::uint32_t bytes);
@@ -175,6 +198,7 @@ class Nic {
   std::unordered_map<net::FlowId, SteeringRule> rules_;
   DropHook on_drop_;
   SlowPathHook slow_path_;
+  SteerHook steer_hook_;
   std::uint64_t buf_used_ = 0;
   TimeWeighted buf_occ_;
   NicStats stats_;

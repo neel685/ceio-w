@@ -22,6 +22,8 @@ struct FlowResult {
   std::uint64_t delivered_bytes = 0;
   std::uint64_t drops_switch = 0;
   std::uint64_t drops_nic = 0;
+  std::uint64_t slow_packets = 0;  ///< CEIO: packets that went through on-NIC memory
+  std::uint64_t reordered = 0;     ///< deliveries older than one already delivered
   double goodput_gbps = 0;
   double mpps = 0;
   LatencySummary latency;  ///< sender emit -> application done
@@ -52,6 +54,12 @@ struct Results {
   std::uint64_t drops_switch = 0;
   std::uint64_t drops_nic = 0;
   std::uint64_t ecn_marked = 0;
+  std::uint64_t reordered = 0;
+
+  std::string policy = "baseline";
+  policy::CeioStats ceio;           ///< zero unless policy == kCeio
+  std::int64_t ceio_total_credits = 0;
+  bool ceio_credits_conserved = true;  ///< CreditManager invariant at the end of the run
 
   hw::CacheStats cache;
   double io_write_hit_rate = 0;   ///< PCIe write hit rate

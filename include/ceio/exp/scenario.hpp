@@ -12,6 +12,7 @@
 #include "ceio/net/link.hpp"
 #include "ceio/net/traffic.hpp"
 #include "ceio/nic/nic.hpp"
+#include "ceio/policy/ceio.hpp"
 
 namespace ceio::exp {
 
@@ -39,6 +40,12 @@ struct PressureSetup {
   double write_fraction = 0.3;
 };
 
+/// Receive-path I/O management scheme under test.
+enum class IoPolicy {
+  kBaseline,  ///< legacy DDIO datapath (DPDK / AF_XDP defaults)
+  kCeio,      ///< [CEIO]: credit-based flow control + elastic on-NIC buffering
+};
+
 /// Complete, self-contained description of one simulation run.
 struct Scenario {
   std::string name = "custom";
@@ -56,6 +63,9 @@ struct Scenario {
   std::vector<QueueSetup> queues;
   std::vector<FlowSetup> flows;
   PressureSetup pressure;
+
+  IoPolicy policy = IoPolicy::kBaseline;
+  policy::CeioConfig ceio;
 
   /// Throws std::invalid_argument describing the first inconsistency.
   void validate() const;

@@ -48,6 +48,8 @@ add_library(ceio_core
   src/host/app.cpp
   src/host/core.cpp
   src/nic/nic.cpp
+  src/policy/credit_manager.cpp
+  src/policy/ceio.cpp
   src/exp/scenario.cpp
   src/exp/experiment.cpp)
 add_library(ceio::core ALIAS ceio_core)

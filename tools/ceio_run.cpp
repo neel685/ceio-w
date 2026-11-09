@@ -38,6 +38,11 @@ CPU-bypass (RDMA write) flows
   --bypass=N                 number of RDMA flows/queues (default 0)
   --bypass-rate=GBPS         per-flow rate (default 20)
   --bypass-msg=BYTES         message size (default 65536)
+I/O policy
+  --policy=baseline|ceio     receive-path scheme (default baseline)
+  --ceio-credits=N           total credits (default: DDIO bytes / buffer size)
+  --ceio-recv=sync|async     slow-path fetch API (default async)
+  --ceio-ideal=0|1           per-packet credit check instead of counter polling
 Run control
   --warmup-ms=MS             (default 2)    --measure-ms=MS  (default 4)
   --seed=N                   (default 1)
@@ -151,7 +156,18 @@ exp::Scenario build(Opts& o) {
     f.queue = static_cast<std::uint32_t>(s.queues.size() - 1);
     s.flows.push_back(f);
   }
-  s.name = tb + "/" + q.app.name;
+  const std::string policy = o.str("policy", "baseline");
+  if (policy == "ceio") {
+    s.policy = exp::IoPolicy::kCeio;
+  } else if (policy != "baseline") {
+    throw std::invalid_argument("unknown policy '" + policy + "'");
+  }
+  s.ceio.total_credits = static_cast<std::int64_t>(o.num("ceio-credits", 0));
+  const std::string recv = o.str("ceio-recv", "async");
+  if (recv != "sync" && recv != "async") throw std::invalid_argument("--ceio-recv must be sync or async");
+  s.ceio.recv = recv == "sync" ? policy::CeioConfig::Recv::kSync : policy::CeioConfig::Recv::kAsync;
+  s.ceio.ideal_detection = o.num("ceio-ideal", 0) != 0;
+  s.name = tb + "/" + q.app.name + "/" + policy;
   return s;
 }
 

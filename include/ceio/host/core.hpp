@@ -9,6 +9,7 @@
 #include "ceio/host/app.hpp"
 #include "ceio/host/buffer_pool.hpp"
 #include "ceio/host/refill.hpp"
+#include "ceio/host/rx_extension.hpp"
 #include "ceio/hw/memory_system.hpp"
 #include "ceio/hw/pcie.hpp"
 #include "ceio/nic/nic.hpp"
@@ -64,6 +65,7 @@ class CpuCore {
 
   void set_refill_policy(std::unique_ptr<RefillPolicy> p) { refill_ = std::move(p); }
   void set_done_hook(DoneHook h) { on_done_ = std::move(h); }
+  void set_extension(RxExtension* ext) { ext_ = ext; }
 
   /// Posts the initial descriptors and starts polling.
   void start();
@@ -102,6 +104,8 @@ class CpuCore {
   double link_gbps_;
   std::unique_ptr<RefillPolicy> refill_;
   DoneHook on_done_;
+  RxExtension* ext_ = nullptr;
+  bool waiting_ext_ = false;  // busy-waiting for data an extension is fetching
 
   std::deque<nic::RxCompletion> batch_;
   struct Prefetch {
