@@ -4,10 +4,12 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
 #include "ceio/host/core.hpp"
+#include "ceio/host/refill.hpp"
 #include "ceio/host/rx_extension.hpp"
 #include "ceio/nic/nic.hpp"
 #include "ceio/policy/credit_manager.hpp"
@@ -16,7 +18,14 @@
 namespace ceio::policy {
 
 struct CeioConfig {
+  enum class Variant {
+    kCeio,   ///< the published design
+    kCeioW,  ///< CEIO-W (docs/ceio-w.md): ring-as-credit, adaptive allocation and budget
+  };
+  Variant variant = Variant::kCeio;
+
   /// Total credits; 0 = DDIO capacity / buffer size (Eq. 1; 6 MB / 2 KB = 3072).
+  /// For CEIO-W this is the upper bound of the adaptive footprint budget.
   std::int64_t total_credits = 0;
   bool literal_split = false;  ///< Algorithm 1 line 12 applied literally (ablation)
   /// Check credits per packet in the match-action stage (idealised) instead of
@@ -56,6 +65,17 @@ struct CeioConfig {
   std::uint64_t cc_threshold_bytes = 32 * 1024;
   /// Minimum gap between NIC-generated notifications per flow (DCQCN CNP timer).
   Tick cnp_interval = 50 * kMicrosecond;
+
+  // ---- CEIO-W (docs/ceio-w.md Sec. 4) ----
+  double w_k = 10.0;                    ///< target = k x recent packets per driver batch
+  std::int64_t w_min_target = 16;       ///< buffers per flow, at least
+  std::int64_t w_bulk_credits = 64;     ///< cap for RDMA (CPU-bypass) flows
+  double w_budget_fraction = 0.5;       ///< initial budget as a fraction of Eq. (1)
+  bool w_adaptive_alloc = true;         ///< adaptive allocation (else an equal split of the budget)
+  bool w_adaptive_budget = true;        ///< adaptive budget (else the budget stays at its initial value)
+  Tick w_alloc_period = 20 * kMicrosecond;
+  Tick w_budget_period = 100 * kMicrosecond;
+  double w_miss_target = 0.05;          ///< host LLC load miss rate that shrinks the budget
 };
 
 struct CeioFlowInfo {
@@ -80,6 +100,11 @@ struct CeioStats {
   std::uint64_t reactivations = 0;
   double nic_mem_max_bytes = 0;
   std::int64_t min_credit_balance = 0;  ///< most negative balance seen (detection lag)
+  // CEIO-W
+  std::int64_t w_budget = 0;            ///< footprint budget at the end of the run (buffers)
+  std::int64_t w_budget_min = 0;        ///< smallest budget reached
+  std::uint64_t w_budget_cuts = 0;
+  std::int64_t w_max_in_use = 0;        ///< largest total footprint (posted + unprocessed)
 };
 
 /// CEIO ([CEIO] Sec. 3-Sec. 5): credit-based flow control at the NIC plus elastic
@@ -110,6 +135,15 @@ class CeioController final : public host::RxExtension {
   void set_congestion_hook(std::function<void(net::FlowId)> h) { on_congestion_ = std::move(h); }
   const CreditManager& credits() const { return cm_; }
   std::uint64_t slow_packets(net::FlowId f) const;
+
+  // CEIO-W host-side credit interface (used by CeioWRefill).
+  /// Buffers flow `f` may still post (target - posted - unprocessed).
+  std::int64_t allowance(net::FlowId f) const;
+  void on_posted(net::FlowId f, std::uint32_t n);
+  /// The CPU-involved flow served by queue `q`, if any (CEIO-W: one per queue).
+  std::optional<net::FlowId> descriptor_flow(nic::QueueId q) const;
+  std::int64_t target(net::FlowId f) const;
+  bool warm_variant() const { return cfg_.variant == CeioConfig::Variant::kCeioW; }
   std::uint64_t nic_mem_used() const { return nic_mem_used_; }
   const CeioConfig& config() const { return cfg_; }
 
@@ -135,6 +169,11 @@ class CeioController final : public host::RxExtension {
     std::deque<net::Packet> held;      // on-chip, arrived while paused
     Tick last_cnp = 0;
     bool sent_cnp = false;
+    // CEIO-W
+    std::int64_t target = 0;       // credit target (buffers)
+    std::int64_t in_use = 0;       // descriptor: posted + unprocessed; RDMA: fast and unprocessed
+    double batch_ewma = 0;         // packets processed per driver batch
+    std::int64_t batch_count = 0;
   };
 
   void on_steer(const net::Packet& p, nic::SteeringRule& rule);
@@ -153,6 +192,11 @@ class CeioController final : public host::RxExtension {
   void drain_rdma(Flow& f);
   Tick nic_mem_read(net::FlowId flow, std::uint32_t bytes);
   void release_nic_mem(Flow& f, const net::Packet& p);
+  bool active(net::FlowId id) const;
+  std::int64_t upgrade_room(const Flow& f) const;
+  void w_recompute_targets();
+  void w_alloc_loop();
+  void w_budget_loop();
 
   Simulator& sim_;
   nic::Nic& nic_;
@@ -167,8 +211,30 @@ class CeioController final : public host::RxExtension {
   std::uint64_t nic_mem_used_ = 0;
   Tick nic_mem_free_ = 0;
   std::vector<Tick> nic_core_free_;
+  // CEIO-W
+  std::int64_t budget_ = 0;
+  std::int64_t budget_max_ = 0;
+  std::vector<host::CpuCore*> cpu_cores_;
+  std::uint64_t seen_hits_ = 0, seen_misses_ = 0;
   CeioStats stats_;
   std::function<void(net::FlowId)> on_congestion_;
+};
+
+/// CEIO-W ring-as-credit, driver side: posts only as many buffers as the flow's credits allow,
+/// so posted + unprocessed buffers never exceed its target.
+class CeioWRefill final : public host::RefillPolicy {
+ public:
+  CeioWRefill(CeioController& c, net::FlowId f) : c_(c), f_(f) {}
+  std::uint32_t to_post(const host::RefillContext& ctx) override {
+    const std::int64_t a = c_.allowance(f_);
+    const std::int64_t room = static_cast<std::int64_t>(ctx.ring_capacity) - ctx.ring_available;
+    return a > 0 ? static_cast<std::uint32_t>(std::min(a, room)) : 0;
+  }
+  void on_posted(std::uint32_t n) override { c_.on_posted(f_, n); }
+
+ private:
+  CeioController& c_;
+  net::FlowId f_;
 };
 
 }  // namespace ceio::policy

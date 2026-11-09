@@ -42,7 +42,11 @@ CPU-bypass (RDMA write) flows
   --bypass-msg=BYTES         message size (default 65536)
 Paper scenarios (replace the options above)
   --preset=dynamic|burst|mixed   [CEIO] Fig. 4a/10a, Fig. 4b/10b, Table 4
-  --scheme=NAME              baseline|hostcc|shring|ceio|toasty (with DCTCP)
+  --scheme=NAME              baseline|hostcc|shring|ceio|toasty|ceio-w (with DCTCP)
+  --warm=1                   ablation: CEIO with a LIFO pool + eager TX
+  --w-budget=F               CEIO-W initial budget as a fraction of Eq. (1) (default 0.5)
+  --w-static=1               CEIO-W with a fixed budget
+  --w-equal=1                CEIO-W with an equal split instead of adaptive allocation
   --phase-ms=MS              phase length for dynamic/burst (default 2)
   --phases=N                 number of phases (default 3 dynamic, 4 burst)
   --cpu-flows=N              CPU-involved flows for mixed (default 4)
@@ -102,22 +106,32 @@ net::TrafficSpec::Pattern pattern_of(const std::string& p) {
   throw std::invalid_argument("unknown pattern '" + p + "'");
 }
 
+void apply_ceio_w_options(Opts& o, exp::Scenario& s) {
+  s.ceio.w_budget_fraction = o.num("w-budget", s.ceio.w_budget_fraction);
+  if (o.num("w-static", 0) != 0) s.ceio.w_adaptive_budget = false;
+  if (o.num("w-equal", 0) != 0) s.ceio.w_adaptive_alloc = false;
+}
+
 exp::Scenario build_preset(Opts& o, const std::string& preset) {
   const exp::Scheme scheme = exp::scheme_from_name(o.str("scheme", "baseline"));
+  exp::SchemeOptions so;
+  so.warm_pool = o.num("warm", 0) != 0;
   exp::KvWorkload kv;
   kv.demand_gbps = o.num("kv-demand", kv.demand_gbps);
   const Tick phase = from_us(o.num("phase-ms", 2) * 1000);
   exp::Scenario s;
   if (preset == "dynamic") {
-    s = exp::ceio_dynamic_flows(scheme, phase, static_cast<int>(o.num("phases", 3)), kv);
+    s = exp::ceio_dynamic_flows(scheme, phase, static_cast<int>(o.num("phases", 3)), kv, {}, so);
   } else if (preset == "burst") {
-    s = exp::ceio_network_burst(scheme, phase, static_cast<int>(o.num("phases", 4)), kv);
+    s = exp::ceio_network_burst(scheme, phase, static_cast<int>(o.num("phases", 4)), kv, so);
   } else if (preset == "mixed") {
-    s = exp::ceio_mixed_flows(scheme, static_cast<int>(o.num("cpu-flows", 4)), kv);
+    s = exp::ceio_mixed_flows(scheme, static_cast<int>(o.num("cpu-flows", 4)), kv, {}, so);
   } else {
     throw std::invalid_argument("unknown preset '" + preset + "'");
   }
   s.seed = static_cast<std::uint64_t>(o.num("seed", 1));
+  s.pressure.gbytes_per_s = o.num("pressure", 0);
+  apply_ceio_w_options(o, s);
   const double cc_kb = o.num("ceio-cc-kb", -1);
   if (cc_kb >= 0) s.ceio.cc_threshold_bytes = static_cast<std::uint64_t>(cc_kb * 1024);
   return s;
@@ -213,7 +227,9 @@ exp::Scenario build(Opts& o) {
   if (!scheme.empty()) {
     exp::SchemeOptions so;
     so.dctcp = s.dctcp.enabled;
+    so.warm_pool = o.num("warm", 0) != 0;
     exp::apply_scheme(s, exp::scheme_from_name(scheme), so);
+    apply_ceio_w_options(o, s);
   } else {
     s.name += "/" + policy;
   }

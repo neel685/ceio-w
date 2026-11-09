@@ -13,6 +13,7 @@ enum class Scheme {
   kShRing,    ///< one shared receive ring below LLC capacity ([CEIO] [61])
   kCeio,      ///< credits + elastic on-NIC buffering ([CEIO])
   kToasty,    ///< LIFO pool + adaptive refill + eager TX ([Toasty])
+  kCeioW,     ///< CEIO-W (docs/ceio-w.md): warm, footprint-aware, ring-as-credit
 };
 
 std::string scheme_name(Scheme s);
@@ -21,6 +22,7 @@ Scheme scheme_from_name(const std::string& name);  ///< throws std::invalid_argu
 struct SchemeOptions {
   std::uint32_t shring_ring = 4096;  ///< shared ring entries ([CEIO] Sec. 6.1)
   bool dctcp = true;                 ///< senders run DCTCP ([CEIO] Sec. 2.3)
+  bool warm_pool = false;            ///< ablation: give CEIO a LIFO pool + eager TX (warm buffers only)
 };
 
 /// Turns a scenario with one descriptor queue per core into `scheme`:
@@ -56,14 +58,15 @@ inline constexpr Tick kLeadIn = kMillisecond;
 /// [CEIO] Fig. 4a / 10a, dynamic flow distribution: 8 CPU-involved flows; every
 /// `phase`, two of them are replaced by CPU-bypass flows (`phases` phases total).
 Scenario ceio_dynamic_flows(Scheme scheme, Tick phase = 2 * kMillisecond, int phases = 3,
-                            const KvWorkload& kv = {}, const BypassWorkload& bypass = {});
+                            const KvWorkload& kv = {}, const BypassWorkload& bypass = {},
+                            const SchemeOptions& opt = {});
 /// [CEIO] Fig. 4b / 10b, network burst: 8 CPU-involved flows plus two burst
 /// CPU-involved flows (two extra cores) active in every other phase.
 Scenario ceio_network_burst(Scheme scheme, Tick phase = 2 * kMillisecond, int phases = 4,
-                            const KvWorkload& kv = {});
+                            const KvWorkload& kv = {}, const SchemeOptions& opt = {});
 /// [CEIO] Table 4, mixed I/O flows: `cpu_flows` CPU-involved + (8 - cpu_flows)
 /// CPU-bypass flows, steady.
 Scenario ceio_mixed_flows(Scheme scheme, int cpu_flows, const KvWorkload& kv = {},
-                          const BypassWorkload& bypass = {});
+                          const BypassWorkload& bypass = {}, const SchemeOptions& opt = {});
 
 }  // namespace ceio::exp

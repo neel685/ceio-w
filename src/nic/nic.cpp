@@ -111,6 +111,20 @@ void Nic::deliver_to_buffer(net::Packet p, QueueId qid, std::uint64_t buf, Callb
   dma_descriptor(q, p, buf, false, std::move(on_complete));
 }
 
+std::vector<net::Packet> Nic::reclaim_waiting(QueueId qid) {
+  RxQueue& q = queues_.at(qid);
+  std::vector<net::Packet> out;
+  for (auto& w : q.waiting_) {
+    if (w.on_chip) {
+      q.waiting_bytes_ -= w.p.bytes;
+      release_on_chip(w.p.bytes);
+    }
+    out.push_back(w.p);
+  }
+  q.waiting_.clear();
+  return out;
+}
+
 std::uint64_t Nic::next_cqe(RxQueue& q) {
   const std::uint64_t slot = q.cq_index_++ % q.cfg_.cq_entries;
   return q.cfg_.cq_base + slot * cfg_.cqe_bytes;

@@ -7,12 +7,128 @@ namespace ceio::policy {
 
 CeioController::CeioController(Simulator& sim, nic::Nic& nic, const CeioConfig& cfg,
                                const std::vector<CeioFlowInfo>& flows, std::int64_t total_credits)
-    : sim_(sim), nic_(nic), cfg_(cfg), cm_(total_credits, cfg.literal_split), nic_core_free_(cfg.nic_cores, 0) {
+    : sim_(sim),
+      nic_(nic),
+      cfg_(cfg),
+      cm_(total_credits, cfg.literal_split),
+      nic_core_free_(cfg.nic_cores, 0),
+      budget_(static_cast<std::int64_t>(cfg.w_budget_fraction * static_cast<double>(total_credits))),
+      budget_max_(total_credits) {
   for (const auto& info : flows) {
     if (flows_.count(info.id)) throw std::invalid_argument("CeioController: duplicate flow");
     flows_[info.id].info = info;
     by_queue_[info.queue].push_back(info.id);
   }
+  if (warm_variant()) {
+    for (const auto& [q, ids] : by_queue_) {
+      std::size_t cpu = 0;
+      for (net::FlowId id : ids) cpu += !flows_.at(id).info.rdma;
+      if (cpu > 1) throw std::invalid_argument("CEIO-W: one CPU-involved flow per receive queue");
+    }
+    w_recompute_targets();  // initial equal split, before the drivers' first refill
+  }
+}
+
+bool CeioController::active(net::FlowId id) const {
+  return warm_variant() ? flows_.at(id).established : cm_.active(id);
+}
+
+std::int64_t CeioController::upgrade_room(const Flow& f) const {
+  // CEIO: credits; CEIO-W: buffers already posted in the flow's ring.
+  return warm_variant() ? static_cast<std::int64_t>(nic_.queue(f.info.queue).posted()) : cm_.credits(f.info.id);
+}
+
+std::int64_t CeioController::allowance(net::FlowId id) const {
+  auto it = flows_.find(id);
+  if (it == flows_.end()) return 0;
+  return std::max<std::int64_t>(0, it->second.target - it->second.in_use);
+}
+
+std::int64_t CeioController::target(net::FlowId id) const {
+  auto it = flows_.find(id);
+  return it == flows_.end() ? 0 : it->second.target;
+}
+
+void CeioController::on_posted(net::FlowId id, std::uint32_t n) {
+  Flow& f = flows_.at(id);
+  f.in_use += n;
+  std::int64_t total = 0;
+  for (const auto& [j, g] : flows_) total += g.in_use;
+  stats_.w_max_in_use = std::max(stats_.w_max_in_use, total);
+}
+
+std::optional<net::FlowId> CeioController::descriptor_flow(nic::QueueId q) const {
+  auto it = by_queue_.find(q);
+  if (it == by_queue_.end()) return std::nullopt;
+  for (net::FlowId id : it->second)
+    if (!flows_.at(id).info.rdma) return id;
+  return std::nullopt;
+}
+
+void CeioController::w_recompute_targets() {
+  // Adaptive allocation: demands from recent consumption, water-filled under the budget.
+  std::vector<Flow*> cpu;
+  for (auto& [id, f] : flows_) {
+    if (f.info.rdma) {
+      f.target = cfg_.w_bulk_credits;
+    } else {
+      cpu.push_back(&f);
+    }
+  }
+  if (cpu.empty()) return;
+  const auto n = static_cast<std::int64_t>(cpu.size());
+  if (!cfg_.w_adaptive_alloc) {
+    for (Flow* f : cpu) f->target = std::max(cfg_.w_min_target, budget_ / n);
+    return;
+  }
+  std::vector<double> demand;
+  double total = 0;
+  for (Flow* f : cpu) {
+    const double d = std::max(static_cast<double>(cfg_.w_min_target), cfg_.w_k * f->batch_ewma);
+    demand.push_back(d);
+    total += d;
+  }
+  const double scale = total > static_cast<double>(budget_) ? static_cast<double>(budget_) / total : 1.0;
+  for (std::size_t i = 0; i < cpu.size(); ++i)
+    cpu[i]->target = std::max(cfg_.w_min_target, static_cast<std::int64_t>(demand[i] * scale));
+}
+
+void CeioController::w_alloc_loop() {
+  w_recompute_targets();
+  sim_.schedule_in(cfg_.w_alloc_period, [this] { w_alloc_loop(); });
+}
+
+void CeioController::w_budget_loop() {
+  // Adaptive budget: the host's own PMU-style LLC load counters estimate whether the
+  // footprint fits; a slow AIMD loop on the budget (capacity, not I/O rate).
+  std::uint64_t hits = 0, misses = 0;
+  for (host::CpuCore* c : cpu_cores_) {
+    hits += c->stats().llc_read_hits;
+    misses += c->stats().llc_read_misses;
+  }
+  if (hits < seen_hits_ || misses < seen_misses_) {  // counters were reset (warm-up)
+    seen_hits_ = hits;
+    seen_misses_ = misses;
+  }
+  const std::uint64_t dh = hits - seen_hits_, dm = misses - seen_misses_;
+  seen_hits_ = hits;
+  seen_misses_ = misses;
+  if (dh + dm >= 100) {
+    std::int64_t n_cpu = 0;
+    for (const auto& [id, f] : flows_) n_cpu += !f.info.rdma;
+    const std::int64_t floor = cfg_.w_min_target * std::max<std::int64_t>(n_cpu, 1);
+    const double miss = static_cast<double>(dm) / static_cast<double>(dh + dm);
+    if (miss > cfg_.w_miss_target) {
+      budget_ = std::max(floor, static_cast<std::int64_t>(0.8 * static_cast<double>(budget_)));
+      ++stats_.w_budget_cuts;
+    } else {
+      budget_ = std::min(budget_max_, budget_ + budget_max_ / 20);
+    }
+    w_recompute_targets();
+  }
+  stats_.w_budget = budget_;
+  stats_.w_budget_min = stats_.w_budget_min == 0 ? budget_ : std::min(stats_.w_budget_min, budget_);
+  sim_.schedule_in(cfg_.w_budget_period, [this] { w_budget_loop(); });
 }
 
 void CeioController::start() {
@@ -26,11 +142,18 @@ void CeioController::start() {
   for (auto& [t, ids] : by_start)
     sim_.schedule_at(std::max(t, sim_.now()), [this, group = ids] { establish(group); });
   sim_.schedule_in(0, [this] { control_loop(); });
-  sim_.schedule_in(cfg_.reactivate_period, [this] { reactivation_tick(); });
+  if (warm_variant()) {
+    stats_.w_budget = stats_.w_budget_min = budget_;
+    sim_.schedule_in(cfg_.w_alloc_period, [this] { w_alloc_loop(); });
+    if (cfg_.w_adaptive_budget) sim_.schedule_in(cfg_.w_budget_period, [this] { w_budget_loop(); });
+  } else {
+    sim_.schedule_in(cfg_.reactivate_period, [this] { reactivation_tick(); });
+  }
 }
 
 void CeioController::reset_stats() {
   stats_ = {};
+  stats_.w_budget = stats_.w_budget_min = warm_variant() ? budget_ : 0;
   stats_.nic_mem_max_bytes = static_cast<double>(nic_mem_used_);
   for (auto& [id, f] : flows_) f.slow_total = 0;
 }
@@ -50,7 +173,25 @@ void CeioController::set_mode(Flow& f, Mode m) {
 
 void CeioController::update_mode(Flow& f) {
   const net::FlowId id = f.info.id;
-  if (!cm_.active(id) || f.paused) return;
+  if (!active(id) || f.paused) return;
+  if (warm_variant()) {
+    if (f.info.rdma) {
+      if (f.mode == Mode::kFast && f.in_use >= f.target) set_mode(f, Mode::kSlow);
+      else if (f.mode == Mode::kSlow && f.nic_mem.empty() && f.draining == 0 && f.in_use < f.target)
+        set_mode(f, Mode::kFast);
+      return;
+    }
+    // Descriptor flows go slow only when their ring runs dry (on_steer).
+    if (f.mode == Mode::kFast || f.draining > 0) return;
+    if (f.nic_mem.empty()) {
+      set_mode(f, Mode::kFast);
+      return;
+    }
+    auto c = claimed_.find(f.info.queue);
+    const bool fetch_pending = c != claimed_.end() && c->second > 0;
+    if (!fetch_pending && upgrade_room(f) >= static_cast<std::int64_t>(f.nic_mem.size())) start_upgrade(f);
+    return;
+  }
   const std::int64_t credits = cm_.credits(id);
   if (f.mode == Mode::kFast) {
     if (credits <= 0) set_mode(f, Mode::kSlow);
@@ -76,7 +217,7 @@ void CeioController::start_upgrade(Flow& f) {
     f.nic_mem.pop_front();
     release_nic_mem(f, p);
     p.slow = false;  // lands in the fast ring and holds a credit until processed
-    cm_.consume(id, 1);
+    if (!warm_variant()) cm_.consume(id, 1);  // CEIO-W: the posted buffer already holds it
     ++f.upgrading;
     ++stats_.upgraded_packets;
     sim_.schedule_at(nic_mem_read(id, p.bytes), [this, p, id] {
@@ -92,6 +233,15 @@ void CeioController::finish_upgrade(Flow& f) {
   // as long as credits last. The rest goes to on-NIC memory and the flow stays slow.
   const net::FlowId id = f.info.id;
   f.paused = false;
+  if (warm_variant()) {  // held packets take posted buffers, waiting in order if needed
+    for (net::Packet& p : f.held) {
+      ++stats_.fast_packets;
+      nic_.deliver_to_host(p, f.info.queue);
+    }
+    f.held.clear();
+    set_mode(f, Mode::kFast);
+    return;
+  }
   while (!f.held.empty() && cm_.credits(id) > 0) {
     cm_.consume(id, 1);
     ++stats_.fast_packets;
@@ -115,7 +265,7 @@ void CeioController::finish_upgrade(Flow& f) {
 }
 
 void CeioController::establish(const std::vector<net::FlowId>& ids) {
-  cm_.add_flows(ids);
+  if (!warm_variant()) cm_.add_flows(ids);
   for (net::FlowId id : ids) {
     Flow& f = flows_.at(id);
     f.established = true;
@@ -139,8 +289,8 @@ void CeioController::on_steer(const net::Packet& p, nic::SteeringRule& rule) {
   if (it == flows_.end()) return;
   Flow& f = it->second;
   f.last_arrival = sim_.now();
-  if (!cm_.active(p.flow)) {
-    if (f.established && !f.waiting_reactivation) {
+  if (!active(p.flow)) {
+    if (!warm_variant() && f.established && !f.waiting_reactivation) {
       f.waiting_reactivation = true;
       reactivate_.push_back(p.flow);
     }
@@ -152,6 +302,28 @@ void CeioController::on_steer(const net::Packet& p, nic::SteeringRule& rule) {
     return;
   }
   if (f.mode == Mode::kSlow) return;
+  if (warm_variant()) {
+    if (f.info.rdma) {
+      if (f.in_use >= f.target) return set_mode(f, Mode::kSlow);
+      ++f.in_use;
+    } else if (nic_.queue(f.info.queue).posted() == 0) {
+      // Ring-as-credit: an empty ring is the (exact) out-of-credits signal. Packets still
+      // waiting on-chip for a descriptor are older than this one: move them to
+      // on-NIC memory first so the slow path keeps arrival order.
+      set_mode(f, Mode::kSlow);
+      for (net::Packet& w : nic_.reclaim_waiting(f.info.queue)) {
+        w.slow = true;
+        f.nic_mem.push_back(w);
+        f.nic_mem_bytes += w.bytes;
+        nic_mem_used_ += w.bytes;
+        ++stats_.slow_packets;
+        ++f.slow_total;
+      }
+      return;
+    }
+    ++stats_.fast_packets;
+    return;
+  }
   if (cfg_.ideal_detection) {
     if (cm_.credits(p.flow) <= 0) {
       set_mode(f, Mode::kSlow);  // rewrites `rule`: this packet already goes slow
@@ -203,6 +375,10 @@ void CeioController::on_slow_path(net::Packet p, nic::QueueId) {
 void CeioController::control_loop() {
   for (auto& [id, f] : flows_) {
     if (!f.established) continue;
+    if (warm_variant()) {
+      update_mode(f);
+      continue;
+    }
     if (!cfg_.ideal_detection && f.fast_hits != f.hits_seen) {
       cm_.consume(id, static_cast<std::int64_t>(f.fast_hits - f.hits_seen));
       f.hits_seen = f.fast_hits;
@@ -288,9 +464,9 @@ std::uint32_t CeioController::pending_slow(nic::QueueId q) const {
   for (net::FlowId id : it->second) {
     const Flow& f = flows_.at(id);
     if (f.info.rdma || f.paused) continue;
-    // Flows with credits for their whole backlog are re-enabled by the NIC; the
+    // Flows with room for their whole backlog are re-enabled by the NIC; the
     // host library only pulls data of flows that are out of credits.
-    if (cm_.active(id) && cm_.credits(id) >= static_cast<std::int64_t>(f.nic_mem.size())) continue;
+    if (active(id) && upgrade_room(f) >= static_cast<std::int64_t>(f.nic_mem.size())) continue;
     n += f.nic_mem.size();
   }
   auto c = claimed_.find(q);
@@ -300,6 +476,9 @@ std::uint32_t CeioController::pending_slow(nic::QueueId q) const {
 
 host::RxExtension::PollAction CeioController::on_poll(host::CpuCore& core, std::size_t fast_ready) {
   const nic::QueueId q = core.queue();
+  if (warm_variant() && core.pool() &&
+      std::find(cpu_cores_.begin(), cpu_cores_.end(), &core) == cpu_cores_.end())
+    cpu_cores_.push_back(&core);
   if (!core.pool()) return PollAction::kNone;  // RDMA queues are drained by NIC cores
   const std::uint32_t pending = pending_slow(q);
   std::uint32_t& inflight = drain_inflight_[q];
@@ -366,12 +545,29 @@ void CeioController::drain_descriptor(nic::QueueId q, std::vector<std::uint64_t>
 }
 
 void CeioController::on_processed(host::CpuCore&, const nic::RxCompletion& c) {
-  if (c.fast_pkts > 0 && flows_.count(c.pkt.flow)) unreleased_[c.pkt.flow] += c.fast_pkts;
+  auto it = flows_.find(c.pkt.flow);
+  if (it == flows_.end()) return;
+  if (warm_variant()) {
+    Flow& f = it->second;
+    f.in_use -= c.fast_pkts;  // host-side credits: released as soon as the buffer is done
+    ++f.batch_count;
+    if (f.info.rdma) update_mode(f);
+    return;
+  }
+  if (c.fast_pkts > 0) unreleased_[c.pkt.flow] += c.fast_pkts;
 }
 
 void CeioController::on_batch_end(host::CpuCore& core) {
   auto it = by_queue_.find(core.queue());
   if (it == by_queue_.end()) return;
+  if (warm_variant()) {
+    for (net::FlowId id : it->second) {
+      Flow& f = flows_.at(id);
+      f.batch_ewma = 0.8 * f.batch_ewma + 0.2 * static_cast<double>(f.batch_count);
+      f.batch_count = 0;
+    }
+    return;
+  }
   std::vector<std::pair<net::FlowId, std::int64_t>> released;
   for (net::FlowId id : it->second) {
     auto u = unreleased_.find(id);

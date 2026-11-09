@@ -14,12 +14,14 @@ std::string scheme_name(Scheme s) {
     case Scheme::kShRing: return "shring";
     case Scheme::kCeio: return "ceio";
     case Scheme::kToasty: return "toasty";
+    case Scheme::kCeioW: return "ceio-w";
   }
   return "?";
 }
 
 Scheme scheme_from_name(const std::string& n) {
-  for (Scheme s : {Scheme::kBaseline, Scheme::kHostCc, Scheme::kShRing, Scheme::kCeio, Scheme::kToasty})
+  for (Scheme s : {Scheme::kBaseline, Scheme::kHostCc, Scheme::kShRing, Scheme::kCeio, Scheme::kToasty,
+                   Scheme::kCeioW})
     if (scheme_name(s) == n) return s;
   throw std::invalid_argument("unknown scheme '" + n + "'");
 }
@@ -43,6 +45,21 @@ void apply_scheme(Scenario& s, Scheme scheme, const SchemeOptions& opt) {
       return;
     case Scheme::kCeio:
       s.policy = IoPolicy::kCeio;
+      if (opt.warm_pool)
+        for (auto& q : s.queues)
+          if (q.kind == nic::QueueKind::kDescriptor) {
+            q.order = host::PoolOrder::kLifo;
+            q.core.tx_eager = true;
+          }
+      return;
+    case Scheme::kCeioW:
+      s.policy = IoPolicy::kCeio;
+      s.ceio.variant = policy::CeioConfig::Variant::kCeioW;
+      for (auto& q : s.queues)
+        if (q.kind == nic::QueueKind::kDescriptor) {  // CEIO-W warm buffers
+          q.order = host::PoolOrder::kLifo;
+          q.core.tx_eager = true;
+        }
       return;
     case Scheme::kToasty:
       for (auto& q : s.queues)
@@ -143,7 +160,7 @@ Scenario base(const std::string& name, Tick total) {
 }  // namespace
 
 Scenario ceio_dynamic_flows(Scheme scheme, Tick phase, int phases, const KvWorkload& kv,
-                            const BypassWorkload& bypass) {
+                            const BypassWorkload& bypass, const SchemeOptions& opt) {
   Scenario s = base("ceio-dynamic", kLeadIn + phase * static_cast<Tick>(phases));
   // KV flows 1..8; at the end of phase p, flows 2p-1 and 2p stop and two
   // bypass flows take their place.
@@ -156,11 +173,12 @@ Scenario ceio_dynamic_flows(Scheme scheme, Tick phase, int phases, const KvWorkl
     for (int j = 0; j < 2; ++j)
       add_bypass_flow(s, static_cast<net::FlowId>(100 + 2 * p + j), bypass, kLeadIn + phase * static_cast<Tick>(p),
                       ~Tick{0});
-  apply_scheme(s, scheme);
+  apply_scheme(s, scheme, opt);
   return s;
 }
 
-Scenario ceio_network_burst(Scheme scheme, Tick phase, int phases, const KvWorkload& kv) {
+Scenario ceio_network_burst(Scheme scheme, Tick phase, int phases, const KvWorkload& kv,
+                            const SchemeOptions& opt) {
   Scenario s = base("ceio-burst", kLeadIn + phase * static_cast<Tick>(phases));
   for (int i = 0; i < 8; ++i) add_kv_flow(s, static_cast<net::FlowId>(i + 1), kv, 0, ~Tick{0});
   // Two burst flows per odd phase; each burst gets its own flow id and core.
@@ -169,11 +187,12 @@ Scenario ceio_network_burst(Scheme scheme, Tick phase, int phases, const KvWorkl
     for (int j = 0; j < 2; ++j)
       add_kv_flow(s, id++, kv, kLeadIn + phase * static_cast<Tick>(p), kLeadIn + phase * static_cast<Tick>(p + 1),
                   /*shareable=*/false);
-  apply_scheme(s, scheme);
+  apply_scheme(s, scheme, opt);
   return s;
 }
 
-Scenario ceio_mixed_flows(Scheme scheme, int cpu_flows, const KvWorkload& kv, const BypassWorkload& bypass) {
+Scenario ceio_mixed_flows(Scheme scheme, int cpu_flows, const KvWorkload& kv, const BypassWorkload& bypass,
+                          const SchemeOptions& opt) {
   if (cpu_flows < 0 || cpu_flows > 8) throw std::invalid_argument("ceio_mixed_flows: cpu_flows in [0, 8]");
   Scenario s = ceio_back_to_back();
   s.name = "ceio-mixed-" + std::to_string(cpu_flows) + ":" + std::to_string(8 - cpu_flows);
@@ -182,7 +201,7 @@ Scenario ceio_mixed_flows(Scheme scheme, int cpu_flows, const KvWorkload& kv, co
   for (int i = 0; i < cpu_flows; ++i) add_kv_flow(s, static_cast<net::FlowId>(i + 1), kv, 0, ~Tick{0});
   for (int i = 0; i < 8 - cpu_flows; ++i)
     add_bypass_flow(s, static_cast<net::FlowId>(100 + i), bypass, 0, ~Tick{0});
-  apply_scheme(s, scheme);
+  apply_scheme(s, scheme, opt);
   return s;
 }
 

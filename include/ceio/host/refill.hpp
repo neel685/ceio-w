@@ -26,6 +26,8 @@ class RefillPolicy {
  public:
   virtual ~RefillPolicy() = default;
   virtual std::uint32_t to_post(const RefillContext& ctx) = 0;
+  /// The driver actually posted `n` buffers (may be fewer than requested).
+  virtual void on_posted(std::uint32_t /*n*/) {}
 };
 
 /// Default driver behaviour: keep the descriptor ring full.

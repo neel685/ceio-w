@@ -171,6 +171,9 @@ class Nic {
   /// Slow-path drain into a driver-supplied buffer of a descriptor queue; the
   /// completion is flagged slow. `on_complete` runs when its CQE is visible.
   void deliver_to_buffer(net::Packet p, QueueId q, std::uint64_t buf, Callback on_complete = {});
+  /// Removes and returns, in order, the packets of queue `q` still waiting on-chip
+  /// for a descriptor (e.g. to move them to on-NIC memory ahead of newer packets).
+  std::vector<net::Packet> reclaim_waiting(QueueId q);
 
   void set_drop_hook(DropHook h) { on_drop_ = std::move(h); }
   void set_slow_path(SlowPathHook h) { slow_path_ = std::move(h); }

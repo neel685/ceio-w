@@ -275,18 +275,30 @@ TEST_P(PresetSmoke, DynamicFlowsRunAndSample) {
   EXPECT_EQ(r.flows.size(), 10u);  // 8 KV + 2 bypass
   EXPECT_FALSE(r.samples.empty());
   EXPECT_GT(r.delivered_packets, 10000u);
-  if (GetParam() != exp::Scheme::kShRing) EXPECT_EQ(r.reordered, 0u);
-  if (GetParam() == exp::Scheme::kCeio) EXPECT_TRUE(r.ceio_credits_conserved);
+  if (GetParam() != exp::Scheme::kShRing) {
+    EXPECT_EQ(r.reordered, 0u);
+  }
+  if (GetParam() == exp::Scheme::kCeio) {
+    EXPECT_TRUE(r.ceio_credits_conserved);
+  }
+  if (GetParam() == exp::Scheme::kCeioW || GetParam() == exp::Scheme::kCeio) {
+    EXPECT_EQ(r.drops_nic, 0u);
+  }
 }
 
 INSTANTIATE_TEST_SUITE_P(Schemes, PresetSmoke,
                          ::testing::Values(exp::Scheme::kBaseline, exp::Scheme::kHostCc, exp::Scheme::kShRing,
-                                           exp::Scheme::kCeio, exp::Scheme::kToasty),
-                         [](const auto& info) { return exp::scheme_name(info.param); });
+                                           exp::Scheme::kCeio, exp::Scheme::kToasty, exp::Scheme::kCeioW),
+                         [](const auto& param_info) {
+                           std::string n = exp::scheme_name(param_info.param);
+                           for (char& c : n)
+                             if (c == '-') c = '_';
+                           return n;
+                         });
 
 TEST(Presets, SchemeNamesRoundTrip) {
   for (auto s : {exp::Scheme::kBaseline, exp::Scheme::kHostCc, exp::Scheme::kShRing, exp::Scheme::kCeio,
-                 exp::Scheme::kToasty})
+                 exp::Scheme::kToasty, exp::Scheme::kCeioW})
     EXPECT_EQ(exp::scheme_from_name(exp::scheme_name(s)), s);
   EXPECT_THROW(exp::scheme_from_name("nope"), std::invalid_argument);
 }

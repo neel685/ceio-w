@@ -158,7 +158,12 @@ Results run(const Scenario& s) {
       infos.push_back({f.spec.id, static_cast<nic::QueueId>(f.queue),
                        s.queues[f.queue].kind == nic::QueueKind::kRdma, f.spec.start});
     ceio = std::make_unique<policy::CeioController>(sim, nic, s.ceio, infos, total_credits);
-    for (auto& c : cores) c->set_extension(ceio.get());
+    for (auto& c : cores) {
+      c->set_extension(ceio.get());
+      if (ceio->warm_variant())  // CEIO-W ring-as-credit: the driver posts only what credits allow
+        if (auto flow = ceio->descriptor_flow(c->queue()))
+          c->set_refill_policy(std::make_unique<policy::CeioWRefill>(*ceio, *flow));
+    }
     ceio->set_congestion_hook([&](net::FlowId id) {
       auto it = flow_index.find(id);
       if (it != flow_index.end() && cc[it->second]) cc[it->second]->on_notification();
@@ -249,7 +254,7 @@ Results run(const Scenario& s) {
     r.hostcc = hostcc->stats();
   }
   if (ceio) {
-    r.policy = "ceio";
+    r.policy = ceio->warm_variant() ? "ceio-w" : "ceio";
     r.ceio = ceio->stats();
     r.ceio_total_credits = total_credits;
     r.ceio_credits_conserved = ceio->credits().invariant_ok();
@@ -403,8 +408,12 @@ std::string to_json(const Results& r) {
       .kv("reordered", r.reordered)
       .kv("policy", r.policy);
   latency_json(j, "latency", r.latency);
-  if (r.policy == "ceio") {
+  if (r.policy == "ceio" || r.policy == "ceio-w") {
     j.open("ceio")
+        .kv("w_budget", r.ceio.w_budget)
+        .kv("w_budget_min", r.ceio.w_budget_min)
+        .kv("w_budget_cuts", r.ceio.w_budget_cuts)
+        .kv("w_max_in_use", r.ceio.w_max_in_use)
         .kv("total_credits", r.ceio_total_credits)
         .kv("fast_packets", r.ceio.fast_packets)
         .kv("slow_packets", r.ceio.slow_packets)

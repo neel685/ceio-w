@@ -230,6 +230,7 @@ Tick CpuCore::refill(Tick t) {
   ring_->desc_index += n;
   t += cycles(cfg_.refill_cycles_per_buf * n);
   ring_->in_flight_posts += n;
+  refill_->on_posted(n);
   ++stats_.refills;
   stats_.buffers_posted += n;
   sim_.schedule_at(t, [this, addrs = std::move(addrs), n]() mutable {
