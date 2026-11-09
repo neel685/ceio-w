@@ -1,0 +1,11 @@
+build/
+.cache/
+compile_commands.json
+__pycache__/
+*.pyc
+.venv/
+results/
+*.parquet
+.DS_Store
+docs/generated/quick/
+*.egg-info/
