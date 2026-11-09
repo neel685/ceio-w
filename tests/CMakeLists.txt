@@ -22,6 +22,7 @@ add_executable(ceio_tests
   nic/test_nic.cpp
   policy/test_credit_manager.cpp
   policy/test_ceio.cpp
+  policy/test_baselines.cpp
   exp/test_experiment.cpp)
 target_link_libraries(ceio_tests PRIVATE ceio::core ceio_options GTest::gtest_main)
 

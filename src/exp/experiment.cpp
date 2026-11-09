@@ -1,12 +1,14 @@
 #include "ceio/exp/experiment.hpp"
 
 #include <chrono>
+#include <functional>
 #include <iomanip>
 #include <memory>
 #include <sstream>
 #include <unordered_map>
 
 #include "ceio/host/address_space.hpp"
+#include "ceio/net/congestion.hpp"
 #include "ceio/sim/stats.hpp"
 
 namespace ceio::exp {
@@ -27,6 +29,7 @@ LatencySummary summarize(const Histogram& h) {
 
 struct FlowAcc {
   std::uint64_t sent = 0, delivered = 0, bytes = 0, drop_sw = 0, drop_nic = 0, reordered = 0;
+  std::uint64_t all_bytes = 0;  // whole run, for time series
   bool seen = false;
   std::uint64_t last = 0;  // highest seq (or RDMA message id) delivered so far
   Histogram latency;
@@ -50,9 +53,12 @@ Results run(const Scenario& s) {
   for (std::size_t k = 0; k < s.flows.size(); ++k) flow_index[s.flows[k].spec.id] = k;
   bool measuring = s.warmup == 0;
 
+  std::vector<std::unique_ptr<net::DctcpController>> cc(s.flows.size());
+
   // Queues, pools and cores.
   std::vector<std::unique_ptr<host::BufferPool>> pools;
   std::vector<std::unique_ptr<host::CpuCore>> cores;
+  std::vector<std::uint32_t> core_queue;  // queue index of each core
   for (std::size_t i = 0; i < s.queues.size(); ++i) {
     const QueueSetup& q = s.queues[i];
     const std::string tag = "q" + std::to_string(i);
@@ -72,33 +78,43 @@ Results run(const Scenario& s) {
       pool = pools.back().get();
     }
     const nic::QueueId qid = nic.add_queue(qc);
-    const std::uint64_t table = q.app.table_bytes ? as.allocate(tag + ".table", q.app.table_bytes) : 0;
     const std::uint64_t desc = as.allocate(tag + ".desc", static_cast<std::uint64_t>(q.ring_size) * q.core.descriptor_bytes);
-    cores.push_back(std::make_unique<host::CpuCore>(sim, mem, nic, qid, pool, q.app, q.core,
-                                                    root.derive("core" + std::to_string(i)), table, desc,
-                                                    s.link.rate_gbps));
-    cores.back()->set_done_hook([&, rdma = q.kind == nic::QueueKind::kRdma](const nic::RxCompletion& c, Tick done) {
-      auto it = flow_index.find(c.pkt.flow);
-      if (it == flow_index.end()) return;
-      FlowAcc& a = acc[it->second];
-      const std::uint64_t order = rdma ? c.pkt.msg_id : c.pkt.seq;
-      const bool late = a.seen && order < a.last;
-      a.last = a.seen ? std::max(a.last, order) : order;
-      a.seen = true;
-      if (!measuring) return;
-      if (late) ++a.reordered;
-      a.delivered += rdma ? c.pkt.msg_pkts : 1;
-      a.bytes += c.bytes;
-      a.latency.record(done - c.pkt.sent);
-    });
+    auto ring = std::make_shared<host::SharedRing>();
+    for (std::uint32_t c = 0; c < q.cores; ++c) {
+      const std::uint64_t table =
+          q.app.table_bytes ? as.allocate(tag + ".table" + std::to_string(c), q.app.table_bytes) : 0;
+      const std::string name = "core" + std::to_string(i) + (c ? "." + std::to_string(c) : "");
+      cores.push_back(std::make_unique<host::CpuCore>(sim, mem, nic, qid, pool, q.app, q.core, root.derive(name),
+                                                      table, desc, s.link.rate_gbps, ring));
+      core_queue.push_back(static_cast<std::uint32_t>(i));
+      if (q.refill == QueueSetup::Refill::kToasty)
+        cores.back()->set_refill_policy(std::make_unique<host::ToastyRefill>(q.toasty));
+      cores.back()->set_done_hook([&, rdma = q.kind == nic::QueueKind::kRdma](const nic::RxCompletion& c2, Tick done) {
+        auto it = flow_index.find(c2.pkt.flow);
+        if (it == flow_index.end()) return;
+        if (cc[it->second]) cc[it->second]->on_delivered(c2.pkt.ecn);
+        FlowAcc& a = acc[it->second];
+        a.all_bytes += c2.bytes;
+        const std::uint64_t order = rdma ? c2.pkt.msg_id : c2.pkt.seq;
+        const bool late = a.seen && order < a.last;
+        a.last = a.seen ? std::max(a.last, order) : order;
+        a.seen = true;
+        if (!measuring) return;
+        if (late) ++a.reordered;
+        a.delivered += rdma ? c2.pkt.msg_pkts : 1;
+        a.bytes += c2.bytes;
+        a.latency.record(done - c2.pkt.sent);
+      });
+    }
   }
 
   // Wire and senders.
   net::SwitchPort port(sim, s.link, [&nic](net::Packet p) { nic.receive(p); });
   auto count_drop = [&](const net::Packet& p, bool at_switch) {
-    if (!measuring) return;
     auto it = flow_index.find(p.flow);
     if (it == flow_index.end()) return;
+    if (cc[it->second]) cc[it->second]->on_lost();
+    if (!measuring) return;
     (at_switch ? acc[it->second].drop_sw : acc[it->second].drop_nic)++;
   };
   port.set_drop_hook([&](const net::Packet& p) { count_drop(p, true); });
@@ -113,6 +129,14 @@ Results run(const Scenario& s) {
           if (measuring) ++acc[k].sent;
           port.enqueue(p);
         }));
+    if (s.dctcp.enabled) cc[k] = std::make_unique<net::DctcpController>(sim, *sources.back(), s.dctcp);
+  }
+
+  std::unique_ptr<host::MemoryHog> hog;
+  if (s.pressure.gbytes_per_s > 0) {
+    const std::uint64_t base = as.allocate("hog", s.pressure.region_bytes, 2ULL << 20);
+    hog = std::make_unique<host::MemoryHog>(sim, mem, base, s.pressure.region_bytes, s.pressure.gbytes_per_s,
+                                            s.pressure.write_fraction, root.derive("hog"));
   }
 
   // I/O policy.
@@ -131,23 +155,41 @@ Results run(const Scenario& s) {
     }
     std::vector<policy::CeioFlowInfo> infos;
     for (const auto& f : s.flows)
-      infos.push_back({f.spec.id, cores[f.queue]->queue(), s.queues[f.queue].kind == nic::QueueKind::kRdma,
-                       f.spec.start});
+      infos.push_back({f.spec.id, static_cast<nic::QueueId>(f.queue),
+                       s.queues[f.queue].kind == nic::QueueKind::kRdma, f.spec.start});
     ceio = std::make_unique<policy::CeioController>(sim, nic, s.ceio, infos, total_credits);
     for (auto& c : cores) c->set_extension(ceio.get());
+    ceio->set_congestion_hook([&](net::FlowId id) {
+      auto it = flow_index.find(id);
+      if (it != flow_index.end() && cc[it->second]) cc[it->second]->on_notification();
+    });
     ceio->start();
   }
-
-  std::unique_ptr<host::MemoryHog> hog;
-  if (s.pressure.gbytes_per_s > 0) {
-    const std::uint64_t base = as.allocate("hog", s.pressure.region_bytes, 2ULL << 20);
-    hog = std::make_unique<host::MemoryHog>(sim, mem, base, s.pressure.region_bytes, s.pressure.gbytes_per_s,
-                                            s.pressure.write_fraction, root.derive("hog"));
+  std::unique_ptr<policy::HostCcController> hostcc;
+  if (s.policy == IoPolicy::kHostCc) {
+    hostcc = std::make_unique<policy::HostCcController>(sim, nic, pcie, hog.get(), s.hostcc);
+    hostcc->start();
   }
 
   for (auto& c : cores) c->start();
   for (auto& src : sources) src->start();
+  for (auto& c : cc)
+    if (c) c->start();
   if (hog) hog->start();
+
+  std::vector<Sample> samples;
+  std::vector<std::uint64_t> last_bytes(s.flows.size(), 0);
+  std::function<void()> sampler = [&] {
+    Sample smp;
+    smp.t_ms = to_us(sim.now()) / 1000.0;
+    for (std::size_t k = 0; k < acc.size(); ++k) {
+      smp.flow_gbps.push_back(gbps(acc[k].all_bytes - last_bytes[k], s.sample_interval));
+      last_bytes[k] = acc[k].all_bytes;
+    }
+    samples.push_back(std::move(smp));
+    sim.schedule_in(s.sample_interval, sampler);
+  };
+  if (s.sample_interval > 0) sim.schedule_in(s.sample_interval, sampler);
 
   if (s.warmup > 0) {
     sim.schedule_at(s.warmup, [&] {
@@ -159,6 +201,7 @@ Results run(const Scenario& s) {
       nic.reset_stats();
       for (auto& c : cores) c->reset_stats();
       if (ceio) ceio->reset_stats();
+      if (hostcc) hostcc->reset_stats();
     });
   }
   const Tick end = s.warmup + s.measure;
@@ -198,6 +241,13 @@ Results run(const Scenario& s) {
   }
   r.latency = summarize(all);
   r.ecn_marked = port.stats().ecn_marked;
+  r.samples = std::move(samples);
+  for (const auto& c : cc)
+    if (c) r.cc_rate_reductions += c->reductions();
+  if (hostcc) {
+    r.policy = "hostcc";
+    r.hostcc = hostcc->stats();
+  }
   if (ceio) {
     r.policy = "ceio";
     r.ceio = ceio->stats();
@@ -218,7 +268,8 @@ Results run(const Scenario& s) {
 
   for (std::size_t i = 0; i < cores.size(); ++i) {
     QueueResult q;
-    q.queue = static_cast<std::uint32_t>(i);
+    q.queue = core_queue[i];
+    q.core = static_cast<std::uint32_t>(i);
     q.app = cores[i]->app().name;
     q.core_busy_fraction = static_cast<double>(cores[i]->busy_time()) / static_cast<double>(s.measure);
     q.processed = cores[i]->stats().packets;
@@ -389,6 +440,14 @@ std::string to_json(const Results& r) {
       .kv("iio_occupancy_max_bytes", r.iio_occupancy_max_bytes)
       .close();
   j.kv("nic_buffer_max_bytes", r.nic_buffer_max_bytes);
+  j.kv("cc_rate_reductions", r.cc_rate_reductions);
+  if (r.policy == "hostcc") {
+    j.open("hostcc")
+        .kv("samples", r.hostcc.samples)
+        .kv("congested_samples", r.hostcc.congested_samples)
+        .kv("marked_packets", r.hostcc.marked_packets)
+        .close();
+  }
   j.open("flows", '[');
   for (const auto& f : r.flows) {
     j.open()
@@ -411,6 +470,7 @@ std::string to_json(const Results& r) {
   for (const auto& q : r.queues) {
     j.open()
         .kv("queue", q.queue)
+        .kv("core", q.core)
         .kv("app", q.app)
         .kv("core_busy_fraction", q.core_busy_fraction)
         .kv("llc_read_hit_rate", q.llc_read_hit_rate)
@@ -419,6 +479,14 @@ std::string to_json(const Results& r) {
         .kv("waited_for_descriptor", q.waited_for_descriptor)
         .kv("distinct_buffers_used", q.distinct_buffers_used)
         .close();
+  }
+  j.close(']');
+  j.open("samples", '[');
+  for (const auto& smp : r.samples) {
+    j.open().kv("t_ms", smp.t_ms);
+    j.open("flow_gbps", '[');
+    for (double g : smp.flow_gbps) j.kv(nullptr, g);
+    j.close(']').close();
   }
   j.close(']');
   j.kv("events", r.events).kv("wall_seconds", r.wall_seconds).close();

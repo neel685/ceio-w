@@ -12,6 +12,7 @@
 #include <string>
 
 #include "ceio/exp/experiment.hpp"
+#include "ceio/exp/presets.hpp"
 
 using namespace ceio;
 
@@ -34,12 +35,23 @@ CPU-involved flows (one queue + one core per --cores)
   --ring=N                   descriptor ring size (default 4096)
   --buf=BYTES                buffer size (default: 2048 ceio, 4096 toasty)
   --order=fifo|lifo          free-buffer order (default fifo)
+  --toasty=full|user|kernel  Toasty driver, or only its LIFO pool / adaptive refill
 CPU-bypass (RDMA write) flows
   --bypass=N                 number of RDMA flows/queues (default 0)
   --bypass-rate=GBPS         per-flow rate (default 20)
   --bypass-msg=BYTES         message size (default 65536)
-I/O policy
+Paper scenarios (replace the options above)
+  --preset=dynamic|burst|mixed   [CEIO] Fig. 4a/10a, Fig. 4b/10b, Table 4
+  --scheme=NAME              baseline|hostcc|shring|ceio|toasty (with DCTCP)
+  --phase-ms=MS              phase length for dynamic/burst (default 2)
+  --phases=N                 number of phases (default 3 dynamic, 4 burst)
+  --cpu-flows=N              CPU-involved flows for mixed (default 4)
+  --kv-demand=GBPS           per-flow KV sender demand (default 8)
+  --ceio-cc-kb=KB            CEIO slow-path backlog that triggers congestion control
+I/O policy (single-scenario runs)
+  --scheme=NAME              apply a scheme to the scenario built from options
   --policy=baseline|ceio     receive-path scheme (default baseline)
+  --dctcp=0|1                senders run DCTCP (default 0; schemes turn it on)
   --ceio-credits=N           total credits (default: DDIO bytes / buffer size)
   --ceio-recv=sync|async     slow-path fetch API (default async)
   --ceio-ideal=0|1           per-packet credit check instead of counter polling
@@ -90,7 +102,30 @@ net::TrafficSpec::Pattern pattern_of(const std::string& p) {
   throw std::invalid_argument("unknown pattern '" + p + "'");
 }
 
+exp::Scenario build_preset(Opts& o, const std::string& preset) {
+  const exp::Scheme scheme = exp::scheme_from_name(o.str("scheme", "baseline"));
+  exp::KvWorkload kv;
+  kv.demand_gbps = o.num("kv-demand", kv.demand_gbps);
+  const Tick phase = from_us(o.num("phase-ms", 2) * 1000);
+  exp::Scenario s;
+  if (preset == "dynamic") {
+    s = exp::ceio_dynamic_flows(scheme, phase, static_cast<int>(o.num("phases", 3)), kv);
+  } else if (preset == "burst") {
+    s = exp::ceio_network_burst(scheme, phase, static_cast<int>(o.num("phases", 4)), kv);
+  } else if (preset == "mixed") {
+    s = exp::ceio_mixed_flows(scheme, static_cast<int>(o.num("cpu-flows", 4)), kv);
+  } else {
+    throw std::invalid_argument("unknown preset '" + preset + "'");
+  }
+  s.seed = static_cast<std::uint64_t>(o.num("seed", 1));
+  const double cc_kb = o.num("ceio-cc-kb", -1);
+  if (cc_kb >= 0) s.ceio.cc_threshold_bytes = static_cast<std::uint64_t>(cc_kb * 1024);
+  return s;
+}
+
 exp::Scenario build(Opts& o) {
+  const std::string preset = o.str("preset", "");
+  if (!preset.empty()) return build_preset(o, preset);
   const std::string tb = o.str("testbed", "ceio");
   exp::Scenario s;
   bool toasty = false;
@@ -120,6 +155,11 @@ exp::Scenario build(Opts& o) {
   if (order != "fifo" && order != "lifo") throw std::invalid_argument("--order must be fifo or lifo");
   q.order = order == "lifo" ? host::PoolOrder::kLifo : host::PoolOrder::kFifo;
   q.core.ghz = toasty ? 2.0 : 2.8;
+  const std::string tpart = o.str("toasty", "");
+  if (tpart == "full") exp::apply_toasty(q, exp::ToastyPart::kFull);
+  else if (tpart == "user") exp::apply_toasty(q, exp::ToastyPart::kUserOnly);
+  else if (tpart == "kernel") exp::apply_toasty(q, exp::ToastyPart::kKernelOnly);
+  else if (!tpart.empty()) throw std::invalid_argument("--toasty must be full, user or kernel");
 
   net::TrafficSpec t;
   t.pattern = pattern_of(o.str("pattern", "constant"));
@@ -167,7 +207,16 @@ exp::Scenario build(Opts& o) {
   if (recv != "sync" && recv != "async") throw std::invalid_argument("--ceio-recv must be sync or async");
   s.ceio.recv = recv == "sync" ? policy::CeioConfig::Recv::kSync : policy::CeioConfig::Recv::kAsync;
   s.ceio.ideal_detection = o.num("ceio-ideal", 0) != 0;
-  s.name = tb + "/" + q.app.name + "/" + policy;
+  s.dctcp.enabled = o.num("dctcp", 0) != 0;
+  s.name = tb + "/" + q.app.name;
+  const std::string scheme = o.str("scheme", "");
+  if (!scheme.empty()) {
+    exp::SchemeOptions so;
+    so.dctcp = s.dctcp.enabled;
+    exp::apply_scheme(s, exp::scheme_from_name(scheme), so);
+  } else {
+    s.name += "/" + policy;
+  }
   return s;
 }
 

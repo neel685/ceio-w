@@ -12,7 +12,9 @@
 #include "ceio/net/link.hpp"
 #include "ceio/net/traffic.hpp"
 #include "ceio/nic/nic.hpp"
+#include "ceio/net/congestion.hpp"
 #include "ceio/policy/ceio.hpp"
+#include "ceio/policy/hostcc.hpp"
 
 namespace ceio::exp {
 
@@ -26,6 +28,15 @@ struct QueueSetup {
   std::uint64_t mr_bytes = 64ULL << 20;   ///< registered region (kRdma)
   host::AppProfile app = host::AppProfile::echo();
   host::CoreConfig core;
+  /// Cores polling this queue. 1 = RSS-style per-core ring; >1 = ShRing-style
+  /// shared receive ring and pool ([CEIO] [61]).
+  std::uint32_t cores = 1;
+  /// Whether a ShRing-style scheme may merge this queue into the shared ring
+  /// (false for cores that only exist during bursts).
+  bool shareable = true;
+  enum class Refill { kKeepFull, kToasty };
+  Refill refill = Refill::kKeepFull;
+  host::ToastyRefillConfig toasty;
 };
 
 struct FlowSetup {
@@ -44,7 +55,10 @@ struct PressureSetup {
 enum class IoPolicy {
   kBaseline,  ///< legacy DDIO datapath (DPDK / AF_XDP defaults)
   kCeio,      ///< [CEIO]: credit-based flow control + elastic on-NIC buffering
+  kHostCc,    ///< HostCC: IIO-occupancy signal -> ECN + host-local MBA response
 };
+// ShRing and Toasty are driver/topology configurations (QueueSetup::cores,
+// order, refill, CoreConfig::tx_eager); see exp/presets.hpp.
 
 /// Complete, self-contained description of one simulation run.
 struct Scenario {
@@ -66,6 +80,11 @@ struct Scenario {
 
   IoPolicy policy = IoPolicy::kBaseline;
   policy::CeioConfig ceio;
+  policy::HostCcConfig hostcc;
+  net::DctcpConfig dctcp;  ///< sender congestion control (disabled by default)
+
+  /// Record every flow's goodput every `sample_interval` (0 = off), from t = 0.
+  Tick sample_interval = 0;
 
   /// Throws std::invalid_argument describing the first inconsistency.
   void validate() const;

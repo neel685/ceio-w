@@ -185,10 +185,14 @@ TEST(Ceio, ProtectsCpuInvolvedFlowFromRdmaTraffic) {
 TEST(Ceio, CounterPollingOvershootsIdealDetectionDoesNot) {
   // NIC cores learn about consumption by polling rule hit counters, so a flow can
   // overdraw its credits before its rule is switched to on-NIC memory.
+  // A 20 us control-loop pass (e.g. ~2000 flows at 10 ns each) lets a 26 Gbps flow
+  // overdraw by tens of credits.
   Scenario polled = kv(26, IoPolicy::kCeio, 4096), ideal = kv(26, IoPolicy::kCeio, 4096);
+  polled.ceio.poll_base = 20 * kMicrosecond;
+  ideal.ceio.poll_base = 20 * kMicrosecond;
   ideal.ceio.ideal_detection = true;
   const Results p = run(polled), i = run(ideal);
-  EXPECT_LT(p.ceio.min_credit_balance, 0);
+  EXPECT_LT(p.ceio.min_credit_balance, -10);
   EXPECT_GE(i.ceio.min_credit_balance, 0);
   EXPECT_EQ(i.reordered, 0u);
 }

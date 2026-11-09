@@ -29,8 +29,14 @@ struct FlowResult {
   LatencySummary latency;  ///< sender emit -> application done
 };
 
+struct Sample {
+  double t_ms = 0;                 ///< end of the sampling interval
+  std::vector<double> flow_gbps;   ///< per flow, in Scenario::flows order
+};
+
 struct QueueResult {
   std::uint32_t queue = 0;
+  std::uint32_t core = 0;
   std::string app;
   double core_busy_fraction = 0;
   double llc_read_hit_rate = 0;  ///< this core's loads only (packets, CQEs, tables)
@@ -60,6 +66,8 @@ struct Results {
   policy::CeioStats ceio;           ///< zero unless policy == kCeio
   std::int64_t ceio_total_credits = 0;
   bool ceio_credits_conserved = true;  ///< CreditManager invariant at the end of the run
+  policy::HostCcStats hostcc;
+  std::uint64_t cc_rate_reductions = 0;  ///< DCTCP windows that cut a sender's rate
 
   hw::CacheStats cache;
   double io_write_hit_rate = 0;   ///< PCIe write hit rate
@@ -73,7 +81,8 @@ struct Results {
   double nic_buffer_max_bytes = 0;
 
   std::vector<FlowResult> flows;
-  std::vector<QueueResult> queues;
+  std::vector<QueueResult> queues;   ///< one entry per core
+  std::vector<Sample> samples;
 
   std::uint64_t events = 0;
   double wall_seconds = 0;

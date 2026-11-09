@@ -8,7 +8,8 @@ namespace ceio::host {
 
 CpuCore::CpuCore(Simulator& sim, hw::MemorySystem& mem, nic::Nic& nic, nic::QueueId queue,
                  BufferPool* pool, const AppProfile& app, const CoreConfig& cfg, Rng rng,
-                 std::uint64_t table_base, std::uint64_t desc_ring_base, double link_gbps)
+                 std::uint64_t table_base, std::uint64_t desc_ring_base, double link_gbps,
+                 std::shared_ptr<SharedRing> ring)
     : sim_(sim),
       mem_(mem),
       nic_(nic),
@@ -20,14 +21,18 @@ CpuCore::CpuCore(Simulator& sim, hw::MemorySystem& mem, nic::Nic& nic, nic::Queu
       table_base_(table_base),
       desc_base_(desc_ring_base),
       link_gbps_(link_gbps),
-      refill_(std::make_unique<KeepFullRefill>()) {
+      refill_(std::make_unique<KeepFullRefill>()),
+      ring_(ring ? std::move(ring) : std::make_shared<SharedRing>()) {
   const auto kind = nic_.queue(queue_).config().kind;
   if (kind == nic::QueueKind::kDescriptor && !pool_)
     throw std::invalid_argument("CpuCore: descriptor queue needs a buffer pool");
   if (app_.table_lookups > 0 && app_.table_bytes < 64)
     throw std::invalid_argument("CpuCore: app has lookups but no table");
   if (!(cfg_.ghz > 0.0)) throw std::invalid_argument("CpuCore: ghz must be > 0");
-  nic_.queue(queue_).set_notify([this] { wake(); });
+  ring_->cores.push_back(this);
+  nic_.queue(queue_).set_notify([r = ring_.get()] {
+    for (CpuCore* c : r->cores) c->wake();
+  });
 }
 
 Tick CpuCore::cycles(double c) const { return from_ns(c / cfg_.ghz); }
@@ -84,6 +89,7 @@ void CpuCore::poll() {
 
 void CpuCore::next() {
   if (batch_.empty()) {
+    flush_tx();  // tx_burst at the end of the RX batch
     if (ext_) ext_->on_batch_end(*this);
     const Tick t = refill(sim_.now());
     sim_.schedule_at(t, [this] { poll(); });
@@ -153,23 +159,36 @@ void CpuCore::finish(const nic::RxCompletion& c, std::optional<std::uint64_t> tx
     case AppProfile::Reply::kNone:
       recycle(c.buf_addr);
       break;
-    case AppProfile::Reply::kInPlace: {
+    case AppProfile::Reply::kInPlace:
       ++stats_.replies;
-      const std::uint64_t buf = c.buf_addr;
-      nic_.pcie().dma_read(buf, c.bytes, [this, buf] { recycle(buf); });
+      transmit(c.buf_addr, c.bytes);
       break;
-    }
     case AppProfile::Reply::kNewBuffer:
       recycle(c.buf_addr);
       if (tx) {
         ++stats_.replies;
-        const std::uint64_t buf = *tx;
-        nic_.pcie().dma_read(buf, app_.reply_bytes, [this, buf] { recycle(buf); });
+        transmit(*tx, app_.reply_bytes);
       } else {
         ++stats_.reply_drops;
       }
       break;
   }
+}
+
+void CpuCore::transmit(std::uint64_t buf, std::uint32_t bytes) {
+  if (cfg_.tx_eager) {
+    nic_.pcie().dma_read(buf, bytes, [this, buf] { recycle(buf); });
+  } else {
+    pending_tx_.emplace_back(buf, bytes);
+  }
+}
+
+void CpuCore::flush_tx() {
+  for (const auto& [buf, bytes] : pending_tx_) {
+    const std::uint64_t b = buf;
+    nic_.pcie().dma_read(b, bytes, [this, b] { recycle(b); });
+  }
+  pending_tx_.clear();
 }
 
 void CpuCore::recycle(std::uint64_t buf) {
@@ -183,7 +202,7 @@ Tick CpuCore::refill(Tick t) {
   auto& q = nic_.queue(queue_);
   RefillContext ctx;
   ctx.ring_capacity = q.config().ring_size;
-  ctx.ring_available = q.posted() + in_flight_posts_;
+  ctx.ring_available = q.posted() + ring_->in_flight_posts;
   ctx.pool_free = pool_->free_count();
   ctx.recycled_since_last = recycled_since_refill_;
   ctx.dmaed_since_last = static_cast<std::uint32_t>(q.dma_total() - dmaed_at_last_refill_);
@@ -204,18 +223,18 @@ Tick CpuCore::refill(Tick t) {
   for (std::uint32_t i = 0; i < n; ++i) addrs.push_back(*pool_->get());
   // Descriptor writes: one contiguous run in the ring, split where it wraps.
   const std::uint64_t ring = ctx.ring_capacity;
-  const std::uint64_t first = desc_index_ % ring;
+  const std::uint64_t first = ring_->desc_index % ring;
   const std::uint64_t run1 = std::min<std::uint64_t>(n, ring - first);
   t = mem_.cpu_store(t, desc_base_ + first * cfg_.descriptor_bytes, run1 * cfg_.descriptor_bytes);
   if (run1 < n) t = mem_.cpu_store(t, desc_base_, (n - run1) * cfg_.descriptor_bytes);
-  desc_index_ += n;
+  ring_->desc_index += n;
   t += cycles(cfg_.refill_cycles_per_buf * n);
-  in_flight_posts_ += n;
+  ring_->in_flight_posts += n;
   ++stats_.refills;
   stats_.buffers_posted += n;
   sim_.schedule_at(t, [this, addrs = std::move(addrs), n]() mutable {
     nic_.pcie().mmio_write(8, [this, addrs = std::move(addrs), n] {
-      in_flight_posts_ -= n;
+      ring_->in_flight_posts -= n;
       nic_.post_buffers(queue_, addrs);
     });
   });
@@ -230,15 +249,28 @@ MemoryHog::MemoryHog(Simulator& sim, hw::MemorySystem& mem, std::uint64_t base, 
       lines_(bytes / 64),
       write_fraction_(write_fraction),
       rng_(rng),
-      period_(gbytes_per_s > 0 ? transfer_time(kLinesPerTick * 64ULL, gbytes_per_s * 8.0) : 0) {
+      gbs_(0),
+      period_(0) {
   if (lines_ == 0) throw std::invalid_argument("MemoryHog: region too small");
+  set_gbytes_per_s(gbytes_per_s);
+}
+
+void MemoryHog::set_gbytes_per_s(double gbs) {
+  gbs_ = std::max(gbs, 0.0);
+  period_ = gbs_ > 0 ? transfer_time(kLinesPerTick * 64ULL, gbs_ * 8.0) : 0;
 }
 
 void MemoryHog::start() {
-  if (period_ > 0) sim_.schedule_in(0, [this] { tick(); });
+  if (running_) return;
+  running_ = true;
+  sim_.schedule_in(0, [this] { tick(); });
 }
 
 void MemoryHog::tick() {
+  if (period_ == 0) {  // paused: check again later
+    sim_.schedule_in(kMicrosecond, [this] { tick(); });
+    return;
+  }
   for (std::uint32_t i = 0; i < kLinesPerTick; ++i) {
     const std::uint64_t addr = base_ + rng_.uniform_int(0, lines_ - 1) * 64;
     if (rng_.bernoulli(write_fraction_))

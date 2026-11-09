@@ -35,6 +35,7 @@ void Nic::reset_stats() {
 
 void Nic::receive(net::Packet p) {
   ++stats_.rx_packets;
+  if (ingress_hook_) ingress_hook_(p);
   sim_.schedule_in(cfg_.pipeline_latency, [this, p] { steer(p); });
 }
 

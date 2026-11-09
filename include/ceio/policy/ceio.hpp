@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <unordered_map>
 #include <vector>
@@ -29,11 +30,13 @@ struct CeioConfig {
   std::uint64_t nic_mem_bytes = 16ULL << 30;
   Tick nic_mem_latency = 500 * kNanosecond;
   double nic_mem_gbps = 400.0;
-  /// NIC (ARM) cores serving the slow path: each moved packet costs one core this
-  /// long (DMA descriptor + bookkeeping). 2 x 300 ns ~ 6.7 Mpps, which puts the
-  /// slow path within ~22 % of the fast path at 4 KB messages ([CEIO] Fig. 11).
-  std::uint32_t nic_cores = 2;
-  Tick nic_core_per_packet = 300 * kNanosecond;
+  /// NIC (ARM) cores serving the slow path. Each flow is pinned to one core ("an
+  /// on-NIC core is assigned to monitor this flow", [CEIO] Sec. 4.1); each moved packet
+  /// costs it this long. 150 ns ~ 6.7 Mpps per flow, which puts a single flow's
+  /// slow path at ~1/3 of the fast path at 512 B and equal at 4 KB ([CEIO] Fig. 11).
+  /// BlueField-3 has 16 Arm cores.
+  std::uint32_t nic_cores = 16;
+  Tick nic_core_per_packet = 150 * kNanosecond;
 
   enum class Recv {
     kSync,   ///< recv(): fetch slow-path data only when the fast ring is empty, and block
@@ -48,8 +51,11 @@ struct CeioConfig {
   Tick reactivate_period = 100 * kMicrosecond;
   std::uint32_t reactivate_per_tick = 32;
 
-  /// Per-flow NIC-memory backlog that makes the NIC trigger congestion control.
-  std::uint64_t cc_threshold_bytes = 1ULL << 20;
+  /// Per-flow NIC-memory backlog above which slow-path packets are ECN-marked:
+  /// the slow path is producing faster than it drains ([CEIO] Sec. 4.1). DCTCP-K sized.
+  std::uint64_t cc_threshold_bytes = 32 * 1024;
+  /// Minimum gap between NIC-generated notifications per flow (DCQCN CNP timer).
+  Tick cnp_interval = 50 * kMicrosecond;
 };
 
 struct CeioFlowInfo {
@@ -100,6 +106,8 @@ class CeioController final : public host::RxExtension {
 
   const CeioStats& stats() const { return stats_; }
   void reset_stats();
+  /// Called when the NIC triggers congestion control for a flow ([CEIO] Sec. 4.1).
+  void set_congestion_hook(std::function<void(net::FlowId)> h) { on_congestion_ = std::move(h); }
   const CreditManager& credits() const { return cm_; }
   std::uint64_t slow_packets(net::FlowId f) const;
   std::uint64_t nic_mem_used() const { return nic_mem_used_; }
@@ -125,6 +133,8 @@ class CeioController final : public host::RxExtension {
     bool paused = false;
     std::uint32_t upgrading = 0;       // backlog packets not yet handed to the DMA engine
     std::deque<net::Packet> held;      // on-chip, arrived while paused
+    Tick last_cnp = 0;
+    bool sent_cnp = false;
   };
 
   void on_steer(const net::Packet& p, nic::SteeringRule& rule);
@@ -141,7 +151,7 @@ class CeioController final : public host::RxExtension {
   void request_drain(host::CpuCore& core, std::uint32_t n);
   void drain_descriptor(nic::QueueId q, std::vector<std::uint64_t> bufs, host::BufferPool* pool);
   void drain_rdma(Flow& f);
-  Tick nic_mem_read(std::uint32_t bytes);
+  Tick nic_mem_read(net::FlowId flow, std::uint32_t bytes);
   void release_nic_mem(Flow& f, const net::Packet& p);
 
   Simulator& sim_;
@@ -158,6 +168,7 @@ class CeioController final : public host::RxExtension {
   Tick nic_mem_free_ = 0;
   std::vector<Tick> nic_core_free_;
   CeioStats stats_;
+  std::function<void(net::FlowId)> on_congestion_;
 };
 
 }  // namespace ceio::policy

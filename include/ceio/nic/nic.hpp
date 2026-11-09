@@ -146,6 +146,8 @@ class Nic {
   /// CEIO's flow controller reconfigures).
   using SteerHook = std::function<void(const net::Packet&, SteeringRule&)>;
   using Callback = std::function<void()>;
+  /// Runs on every frame as it arrives from the wire; may mark it (e.g. HostCC ECN).
+  using IngressHook = std::function<void(net::Packet&)>;
 
   Nic(Simulator& sim, hw::PcieHost& pcie, const NicConfig& cfg = {});
 
@@ -173,6 +175,7 @@ class Nic {
   void set_drop_hook(DropHook h) { on_drop_ = std::move(h); }
   void set_slow_path(SlowPathHook h) { slow_path_ = std::move(h); }
   void set_steer_hook(SteerHook h) { steer_hook_ = std::move(h); }
+  void set_ingress_hook(IngressHook h) { ingress_hook_ = std::move(h); }
 
   std::uint64_t rx_buffer_used() const { return buf_used_; }
   const TimeWeighted& rx_buffer_occupancy() const { return buf_occ_; }
@@ -199,6 +202,7 @@ class Nic {
   DropHook on_drop_;
   SlowPathHook slow_path_;
   SteerHook steer_hook_;
+  IngressHook ingress_hook_;
   std::uint64_t buf_used_ = 0;
   TimeWeighted buf_occ_;
   NicStats stats_;

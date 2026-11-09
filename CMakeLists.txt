@@ -50,8 +50,11 @@ add_library(ceio_core
   src/nic/nic.cpp
   src/policy/credit_manager.cpp
   src/policy/ceio.cpp
+  src/policy/hostcc.cpp
+  src/net/congestion.cpp
   src/exp/scenario.cpp
-  src/exp/experiment.cpp)
+  src/exp/experiment.cpp
+  src/exp/presets.cpp)
 add_library(ceio::core ALIAS ceio_core)
 target_include_directories(ceio_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)

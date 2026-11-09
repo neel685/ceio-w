@@ -5,6 +5,8 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <utility>
+#include <vector>
 
 #include "ceio/host/app.hpp"
 #include "ceio/host/buffer_pool.hpp"
@@ -18,6 +20,16 @@
 
 namespace ceio::host {
 
+class CpuCore;
+
+/// Driver state of one receive ring, shared by every core that serves it
+/// (one core normally; several for ShRing's shared receive ring).
+struct SharedRing {
+  std::uint32_t in_flight_posts = 0;  ///< descriptors written but not yet seen by the NIC
+  std::uint64_t desc_index = 0;
+  std::vector<CpuCore*> cores;
+};
+
 struct CoreConfig {
   double ghz = 2.8;
   std::uint32_t batch = 32;           ///< max completions taken per poll
@@ -30,6 +42,9 @@ struct CoreConfig {
   bool prefetch_next = true;
   std::uint32_t prefetch_bytes = 128;
   Tick l1_latency = 1 * kNanosecond;  ///< cost of touching already-prefetched data
+  /// Transmit replies as soon as they are built ([Toasty] Sec. 3.2) instead of in one
+  /// burst at the end of the RX batch (default AF_XDP / DPDK tx_burst behaviour).
+  bool tx_eager = false;
 };
 
 struct CoreStats {
@@ -61,7 +76,8 @@ class CpuCore {
 
   CpuCore(Simulator& sim, hw::MemorySystem& mem, nic::Nic& nic, nic::QueueId queue,
           BufferPool* pool, const AppProfile& app, const CoreConfig& cfg, Rng rng,
-          std::uint64_t table_base, std::uint64_t desc_ring_base, double link_gbps);
+          std::uint64_t table_base, std::uint64_t desc_ring_base, double link_gbps,
+          std::shared_ptr<SharedRing> ring = nullptr);
 
   void set_refill_policy(std::unique_ptr<RefillPolicy> p) { refill_ = std::move(p); }
   void set_done_hook(DoneHook h) { on_done_ = std::move(h); }
@@ -87,6 +103,8 @@ class CpuCore {
                std::optional<std::uint64_t>& tx_buf);
   Tick refill(Tick t);
   void recycle(std::uint64_t buf);
+  void transmit(std::uint64_t buf, std::uint32_t bytes);
+  void flush_tx();
   void go_idle();
   Tick cycles(double c) const;
 
@@ -100,7 +118,6 @@ class CpuCore {
   Rng rng_;
   std::uint64_t table_base_;
   std::uint64_t desc_base_;
-  std::uint64_t desc_index_ = 0;
   double link_gbps_;
   std::unique_ptr<RefillPolicy> refill_;
   DoneHook on_done_;
@@ -117,7 +134,8 @@ class CpuCore {
   bool idle_ = true;
   bool wake_pending_ = false;
   Tick busy_since_ = 0;
-  std::uint32_t in_flight_posts_ = 0;
+  std::shared_ptr<SharedRing> ring_;
+  std::vector<std::pair<std::uint64_t, std::uint32_t>> pending_tx_;  // batched replies
   std::uint32_t recycled_since_refill_ = 0;
   std::uint64_t dmaed_at_last_refill_ = 0;
   Tick last_refill_ = 0;
@@ -132,6 +150,9 @@ class MemoryHog {
   MemoryHog(Simulator& sim, hw::MemorySystem& mem, std::uint64_t base, std::uint64_t bytes,
             double gbytes_per_s, double write_fraction, Rng rng);
   void start();
+  /// Changes the co-runner's bandwidth (e.g. HostCC's MBA-style host-local response).
+  void set_gbytes_per_s(double gbs);
+  double gbytes_per_s() const { return gbs_; }
 
  private:
   void tick();
@@ -141,7 +162,9 @@ class MemoryHog {
   std::uint64_t lines_;
   double write_fraction_;
   Rng rng_;
+  double gbs_;
   Tick period_;
+  bool running_ = false;
   static constexpr std::uint32_t kLinesPerTick = 16;
 };
 

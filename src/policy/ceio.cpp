@@ -79,7 +79,7 @@ void CeioController::start_upgrade(Flow& f) {
     cm_.consume(id, 1);
     ++f.upgrading;
     ++stats_.upgraded_packets;
-    sim_.schedule_at(nic_mem_read(p.bytes), [this, p, id] {
+    sim_.schedule_at(nic_mem_read(id, p.bytes), [this, p, id] {
       Flow& g = flows_.at(id);
       nic_.deliver_to_host(p, g.info.queue);
       if (--g.upgrading == 0) finish_upgrade(g);
@@ -184,7 +184,15 @@ void CeioController::on_slow_path(net::Packet p, nic::QueueId) {
   stats_.nic_mem_max_bytes = std::max(stats_.nic_mem_max_bytes, static_cast<double>(nic_mem_used_));
   ++stats_.slow_packets;
   ++f.slow_total;
-  if (f.nic_mem_bytes > cfg_.cc_threshold_bytes) ++stats_.cc_signals;
+  if (f.nic_mem_bytes > cfg_.cc_threshold_bytes) {
+    ++stats_.cc_signals;
+    f.nic_mem.back().ecn = true;  // the slow path backs up: ask the sender to slow down
+    if (on_congestion_ && (!f.sent_cnp || sim_.now() - f.last_cnp >= cfg_.cnp_interval)) {
+      f.sent_cnp = true;
+      f.last_cnp = sim_.now();
+      on_congestion_(p.flow);  // NIC-generated notification (CNP), rate-limited
+    }
+  }
   if (f.info.rdma) {
     if (p.msg_last) drain_rdma(f);  // event-driven: write-with-immediate completes a message
   } else {
@@ -232,14 +240,13 @@ void CeioController::reactivation_tick() {
   sim_.schedule_in(cfg_.reactivate_period, [this] { reactivation_tick(); });
 }
 
-Tick CeioController::nic_mem_read(std::uint32_t bytes) {
-  // A NIC core picks the packet up (earliest free core), then its data streams
-  // out of on-NIC memory.
+Tick CeioController::nic_mem_read(net::FlowId flow, std::uint32_t bytes) {
+  // The flow's NIC core moves the packet, then its data streams out of on-NIC memory.
   Tick core_done = sim_.now();
   if (!nic_core_free_.empty()) {
-    auto core = std::min_element(nic_core_free_.begin(), nic_core_free_.end());
-    *core = std::max(sim_.now(), *core) + cfg_.nic_core_per_packet;
-    core_done = *core;
+    Tick& core = nic_core_free_[flow % nic_core_free_.size()];
+    core = std::max(sim_.now(), core) + cfg_.nic_core_per_packet;
+    core_done = core;
   }
   const Tick start = std::max(core_done, nic_mem_free_);
   nic_mem_free_ = start + transfer_time(bytes, cfg_.nic_mem_gbps);
@@ -258,7 +265,7 @@ void CeioController::drain_rdma(Flow& f) {
     release_nic_mem(f, p);
     ++f.draining;
     const net::FlowId id = f.info.id;
-    sim_.schedule_at(nic_mem_read(p.bytes), [this, p, id] {
+    sim_.schedule_at(nic_mem_read(id, p.bytes), [this, p, id] {
       Flow& g = flows_.at(id);
       nic_.deliver_to_host(p, g.info.queue, [this, id] {
         Flow& h = flows_.at(id);
@@ -346,7 +353,7 @@ void CeioController::drain_descriptor(nic::QueueId q, std::vector<std::uint64_t>
     release_nic_mem(*src, p);
     ++src->draining;
     const net::FlowId id = src->info.id;
-    sim_.schedule_at(nic_mem_read(p.bytes), [this, p, q, buf, id] {
+    sim_.schedule_at(nic_mem_read(id, p.bytes), [this, p, q, buf, id] {
       nic_.deliver_to_buffer(p, q, buf, [this, q, id] {
         Flow& f = flows_.at(id);
         --f.draining;
