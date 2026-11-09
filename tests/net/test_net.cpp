@@ -97,6 +97,21 @@ TEST(Traffic, StopTimeAndRateOverride) {
   EXPECT_EQ(n, 63u);  // 5 Gbps of 1000 B = 1.6 us gap -> packets at 0..99.2 us
 }
 
+TEST(Traffic, OnOffScheduleGatesSending) {
+  FlowSpec f = flow(TrafficSpec::Pattern::kConstant, 10.0);
+  f.active = {{100 * kMicrosecond, 200 * kMicrosecond}, {500 * kMicrosecond, 600 * kMicrosecond}};
+  const auto pkts = collect(f, kMillisecond);
+  ASSERT_FALSE(pkts.empty());
+  for (const auto& p : pkts) {
+    const bool in1 = p.sent >= 100 * kMicrosecond && p.sent < 200 * kMicrosecond;
+    const bool in2 = p.sent >= 500 * kMicrosecond && p.sent < 600 * kMicrosecond;
+    EXPECT_TRUE(in1 || in2) << p.sent;
+  }
+  EXPECT_NEAR(static_cast<double>(pkts.size()), 250.0, 2.0);  // 2 x 100 us at 1.25 Mpps
+  EXPECT_EQ(f.next_active(300 * kMicrosecond), 500 * kMicrosecond);
+  EXPECT_EQ(f.next_active(700 * kMicrosecond), ~Tick{0});
+}
+
 TEST(SwitchPort, SerialisesAtLineRateWithWireOverhead) {
   Simulator sim;
   LinkConfig cfg;

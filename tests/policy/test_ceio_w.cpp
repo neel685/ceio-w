@@ -118,12 +118,44 @@ TEST(CeioW, BulkFlowsAreCappedAndKeepTheirThroughput) {
   EXPECT_EQ(r.drops_nic, 0u);
 }
 
-TEST(CeioW, RejectsSharedQueuesItCannotAccount) {
-  Scenario s = kv(10, Scheme::kCeioW);
-  FlowSetup second = s.flows[0];
-  second.spec.id = 2;
-  s.flows.push_back(second);  // two CPU-involved flows on one ring
-  EXPECT_THROW(run(s), std::invalid_argument);
+TEST(CeioW, FlowsSharingAQueueShareItsCreditsAndStayInOrder) {
+  // Credits live per receive queue (O(queues) state): several flows on one ring
+  // share its credit pool, and each keeps its own arrival order across switches.
+  Scenario s = kv(26, Scheme::kCeioW);
+  for (net::FlowId id = 2; id <= 4; ++id) {
+    FlowSetup f = s.flows[0];
+    f.spec.id = id;
+    f.spec.traffic.rate_gbps = 26.0 / 4;
+    s.flows.push_back(f);
+  }
+  s.flows[0].spec.traffic.rate_gbps = 26.0 / 4;
+  const Results r = run(s);
+  EXPECT_GT(r.ceio.slow_packets, 0u);  // overloaded: the shared ring runs dry
+  EXPECT_EQ(r.reordered, 0u);
+  EXPECT_EQ(r.drops_nic, 0u);
+  for (const auto& f : r.flows) EXPECT_GT(f.goodput_gbps, 4.0) << "flow " << f.id;
+}
+
+TEST(CeioW, FlowChurnDoesNotPushFlowsToTheSlowPath) {
+  // Flow churn ([CEIO] Fig. 12): hundreds of flows, a new random set of 16 active every
+  // 100 us. CEIO's per-flow credits either sit with idle flows (1 s timer) or wait
+  // for round-robin re-activation (timer = slot), so traffic moves to the slow
+  // path; CEIO-W's per-queue credits do not depend on which flows are active.
+  ChurnWorkload w;
+  w.n_flows = 512;
+  w.duration = 2 * kMillisecond;
+  Scenario ceio_paper = ceio_flow_churn(Scheme::kCeio, w);
+  Scenario ceio_tuned = ceio_flow_churn(Scheme::kCeio, w);
+  ceio_tuned.ceio.idle_timeout = w.slot;
+  const Results paper = run(ceio_paper), tuned = run(ceio_tuned);
+  const Results cw = run(ceio_flow_churn(Scheme::kCeioW, w));
+  EXPECT_GT(tuned.ceio.slow_packets, tuned.sent_packets / 2);  // RR re-activation lags
+  EXPECT_GT(tuned.ceio.deactivations, 100u);
+  EXPECT_EQ(cw.ceio.slow_packets, 0u);
+  EXPECT_LT(cw.latency.p99_us, tuned.latency.p99_us);
+  EXPECT_LE(cw.latency.p99_us, paper.latency.p99_us);
+  EXPECT_NEAR(cw.goodput_gbps, 60.0, 1.0);
+  EXPECT_EQ(cw.reordered + cw.drops_nic, 0u);
 }
 
 }  // namespace ceio::exp

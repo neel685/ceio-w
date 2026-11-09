@@ -9,6 +9,16 @@ std::uint32_t FlowSpec::packets_per_message() const {
   return std::max<std::uint32_t>(1, (message_bytes + packet_bytes - 1) / packet_bytes);
 }
 
+Tick FlowSpec::next_active(Tick t) const {
+  if (t >= stop) return ~Tick{0};
+  if (active.empty()) return t;
+  for (const auto& [on, off] : active) {
+    if (t < on) return on;
+    if (t < off) return t;
+  }
+  return ~Tick{0};
+}
+
 TrafficSource::TrafficSource(Simulator& sim, const FlowSpec& spec, Rng rng, Sink sink)
     : sim_(sim), spec_(spec), rng_(rng), sink_(std::move(sink)), rate_gbps_(spec.traffic.rate_gbps) {
   if (spec_.packet_bytes == 0) throw std::invalid_argument("FlowSpec: packet_bytes must be > 0");
@@ -41,6 +51,12 @@ Tick TrafficSource::gap_for_message() const {
 
 void TrafficSource::emit_message() {
   if (sim_.now() >= spec_.stop) return;
+  const Tick resume = spec_.next_active(sim_.now());
+  if (resume == ~Tick{0}) return;
+  if (resume > sim_.now()) {  // off period: wake up when the flow turns on again
+    sim_.schedule_at(resume, [this] { emit_message(); });
+    return;
+  }
   const auto& t = spec_.traffic;
   const std::uint32_t msgs =
       t.pattern == TrafficSpec::Pattern::kMicroburst

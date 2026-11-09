@@ -4,7 +4,6 @@
 #include <deque>
 #include <functional>
 #include <map>
-#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -136,13 +135,14 @@ class CeioController final : public host::RxExtension {
   const CreditManager& credits() const { return cm_; }
   std::uint64_t slow_packets(net::FlowId f) const;
 
-  // CEIO-W host-side credit interface (used by CeioWRefill).
-  /// Buffers flow `f` may still post (target - posted - unprocessed).
-  std::int64_t allowance(net::FlowId f) const;
-  void on_posted(net::FlowId f, std::uint32_t n);
-  /// The CPU-involved flow served by queue `q`, if any (CEIO-W: one per queue).
-  std::optional<net::FlowId> descriptor_flow(nic::QueueId q) const;
-  std::int64_t target(net::FlowId f) const;
+  // CEIO-W host-side credit interface (used by CeioWRefill). Credits are per
+  /// receive queue: its ring is the credit pool, shared by the flows it serves.
+  /// Buffers queue `q` may still post (target - posted - unprocessed).
+  std::int64_t allowance(nic::QueueId q) const;
+  void on_posted(nic::QueueId q, std::uint32_t n);
+  /// Whether CEIO-W manages queue `q`'s ring (it serves CPU-involved flows).
+  bool manages_queue(nic::QueueId q) const { return qcred_.count(q) != 0; }
+  std::int64_t target(nic::QueueId q) const;
   bool warm_variant() const { return cfg_.variant == CeioConfig::Variant::kCeioW; }
   std::uint64_t nic_mem_used() const { return nic_mem_used_; }
   const CeioConfig& config() const { return cfg_; }
@@ -169,9 +169,14 @@ class CeioController final : public host::RxExtension {
     std::deque<net::Packet> held;      // on-chip, arrived while paused
     Tick last_cnp = 0;
     bool sent_cnp = false;
-    // CEIO-W
-    std::int64_t target = 0;       // credit target (buffers)
-    std::int64_t in_use = 0;       // descriptor: posted + unprocessed; RDMA: fast and unprocessed
+    // CEIO-W, RDMA flows only (descriptor flows share their queue's credits)
+    std::int64_t target = 0;       // credit cap (buffers)
+    std::int64_t in_use = 0;       // fast-path packets not yet processed
+  };
+  /// CEIO-W credits of one descriptor receive queue (ring-as-credit, adaptive allocation).
+  struct QueueCredits {
+    std::int64_t target = 0;       // posted + unprocessed buffers allowed
+    std::int64_t in_use = 0;       // posted + unprocessed buffers now
     double batch_ewma = 0;         // packets processed per driver batch
     std::int64_t batch_count = 0;
   };
@@ -215,16 +220,19 @@ class CeioController final : public host::RxExtension {
   std::int64_t budget_ = 0;
   std::int64_t budget_max_ = 0;
   std::vector<host::CpuCore*> cpu_cores_;
+  std::map<nic::QueueId, QueueCredits> qcred_;
+  void note_footprint();
+  void divert_to_slow(Flow& f, net::Packet p);
   std::uint64_t seen_hits_ = 0, seen_misses_ = 0;
   CeioStats stats_;
   std::function<void(net::FlowId)> on_congestion_;
 };
 
-/// CEIO-W ring-as-credit, driver side: posts only as many buffers as the flow's credits allow,
+/// CEIO-W ring-as-credit, driver side: posts only as many buffers as the queue's credits allow,
 /// so posted + unprocessed buffers never exceed its target.
 class CeioWRefill final : public host::RefillPolicy {
  public:
-  CeioWRefill(CeioController& c, net::FlowId f) : c_(c), f_(f) {}
+  CeioWRefill(CeioController& c, nic::QueueId q) : c_(c), f_(q) {}
   std::uint32_t to_post(const host::RefillContext& ctx) override {
     const std::int64_t a = c_.allowance(f_);
     const std::int64_t room = static_cast<std::int64_t>(ctx.ring_capacity) - ctx.ring_available;
@@ -234,7 +242,7 @@ class CeioWRefill final : public host::RefillPolicy {
 
  private:
   CeioController& c_;
-  net::FlowId f_;
+  nic::QueueId f_;
 };
 
 }  // namespace ceio::policy

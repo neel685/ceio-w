@@ -160,9 +160,8 @@ Results run(const Scenario& s) {
     ceio = std::make_unique<policy::CeioController>(sim, nic, s.ceio, infos, total_credits);
     for (auto& c : cores) {
       c->set_extension(ceio.get());
-      if (ceio->warm_variant())  // CEIO-W ring-as-credit: the driver posts only what credits allow
-        if (auto flow = ceio->descriptor_flow(c->queue()))
-          c->set_refill_policy(std::make_unique<policy::CeioWRefill>(*ceio, *flow));
+      if (ceio->warm_variant() && ceio->manages_queue(c->queue()))  // CEIO-W ring-as-credit: post only what credits allow
+        c->set_refill_policy(std::make_unique<policy::CeioWRefill>(*ceio, c->queue()));
     }
     ceio->set_congestion_hook([&](net::FlowId id) {
       auto it = flow_index.find(id);

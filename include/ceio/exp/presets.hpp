@@ -69,4 +69,18 @@ Scenario ceio_network_burst(Scheme scheme, Tick phase = 2 * kMillisecond, int ph
 Scenario ceio_mixed_flows(Scheme scheme, int cpu_flows, const KvWorkload& kv = {},
                           const BypassWorkload& bypass = {}, const SchemeOptions& opt = {});
 
+/// [CEIO] Fig. 12, flow churn: `n_flows` echo flows spread over `cores`
+/// cores; every `slot` a fresh random set of `active` flows sends (together
+/// `offered_gbps`, 512 B packets). Open loop (no CC), below CPU capacity, so
+/// differences come from credit management alone.
+struct ChurnWorkload {
+  int n_flows = 1024;
+  Tick slot = 100 * kMicrosecond;
+  int cores = 8;
+  int active = 16;
+  double offered_gbps = 60.0;
+  Tick duration = 4 * kMillisecond;
+};
+Scenario ceio_flow_churn(Scheme scheme, const ChurnWorkload& w = {}, const SchemeOptions& opt = {});
+
 }  // namespace ceio::exp

@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <functional>
+#include <utility>
+#include <vector>
 
 #include "ceio/net/packet.hpp"
 #include "ceio/sim/rng.hpp"
@@ -35,7 +37,12 @@ struct FlowSpec {
   TrafficSpec traffic;
   Tick start = 0;
   Tick stop = ~Tick{0};
+  /// Optional on/off schedule: sorted, disjoint [on, off) intervals. When set, the
+  /// flow only sends inside them (flow churn, [CEIO] Fig. 12).
+  std::vector<std::pair<Tick, Tick>> active;
   std::uint32_t packets_per_message() const;
+  /// Start of the next active period at or after `t` (or ~0 if none).
+  Tick next_active(Tick t) const;
 };
 
 /// Open-loop traffic generator for one flow. It emits packets through `sink`

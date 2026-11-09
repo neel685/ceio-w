@@ -51,6 +51,8 @@ Paper scenarios (replace the options above)
   --phases=N                 number of phases (default 3 dynamic, 4 burst)
   --cpu-flows=N              CPU-involved flows for mixed (default 4)
   --kv-demand=GBPS           per-flow KV sender demand (default 8)
+  --preset=churn             [CEIO] Fig. 12 flow churn, with:
+    --flows=N  --slot-us=US  --active=N  --offered=GBPS  --ceio-idle-us=US (CEIO idle timer)
   --ceio-cc-kb=KB            CEIO slow-path backlog that triggers congestion control
 I/O policy (single-scenario runs)
   --scheme=NAME              apply a scheme to the scenario built from options
@@ -126,6 +128,15 @@ exp::Scenario build_preset(Opts& o, const std::string& preset) {
     s = exp::ceio_network_burst(scheme, phase, static_cast<int>(o.num("phases", 4)), kv, so);
   } else if (preset == "mixed") {
     s = exp::ceio_mixed_flows(scheme, static_cast<int>(o.num("cpu-flows", 4)), kv, {}, so);
+  } else if (preset == "churn") {
+    exp::ChurnWorkload w;
+    w.n_flows = static_cast<int>(o.num("flows", w.n_flows));
+    w.slot = from_us(o.num("slot-us", to_us(w.slot)));
+    w.active = static_cast<int>(o.num("active", w.active));
+    w.offered_gbps = o.num("offered", w.offered_gbps);
+    s = exp::ceio_flow_churn(scheme, w, so);
+    const double idle = o.num("ceio-idle-us", -1);
+    if (idle > 0) s.ceio.idle_timeout = from_us(idle);
   } else {
     throw std::invalid_argument("unknown preset '" + preset + "'");
   }

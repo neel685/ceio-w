@@ -205,4 +205,51 @@ Scenario ceio_mixed_flows(Scheme scheme, int cpu_flows, const KvWorkload& kv, co
   return s;
 }
 
+Scenario ceio_flow_churn(Scheme scheme, const ChurnWorkload& w, const SchemeOptions& opt) {
+  if (w.n_flows < w.active || w.active < 1 || w.cores < 1)
+    throw std::invalid_argument("ceio_flow_churn: need n_flows >= active >= 1 and cores >= 1");
+  Scenario s = ceio_back_to_back();
+  s.name = "ceio-churn-" + std::to_string(w.n_flows) + "f-" + std::to_string(to_us(w.slot)) + "us";
+  s.warmup = kMillisecond;
+  s.measure = w.duration;
+  for (int c = 0; c < w.cores; ++c) {
+    QueueSetup q;
+    q.app = host::AppProfile::echo();
+    q.ring_size = 1024;
+    q.pool_buffers = 4096;
+    s.queues.push_back(q);
+  }
+  // Which flows are active in each slot: a deterministic random sample.
+  Rng rng(0xC0FFEE);
+  const Tick end = s.warmup + s.measure;
+  std::vector<std::vector<std::pair<Tick, Tick>>> on(static_cast<std::size_t>(w.n_flows));
+  for (Tick t = 0; t < end; t += w.slot) {
+    std::vector<int> pick;
+    while (static_cast<int>(pick.size()) < w.active) {
+      const int f = static_cast<int>(rng.uniform_int(0, static_cast<std::uint64_t>(w.n_flows - 1)));
+      if (std::find(pick.begin(), pick.end(), f) == pick.end()) pick.push_back(f);
+    }
+    for (int f : pick) {
+      auto& iv = on[static_cast<std::size_t>(f)];
+      if (!iv.empty() && iv.back().second == t) iv.back().second = t + w.slot;  // merge consecutive slots
+      else iv.emplace_back(t, t + w.slot);
+    }
+  }
+  for (int f = 0; f < w.n_flows; ++f) {
+    FlowSetup fs;
+    fs.spec.id = static_cast<net::FlowId>(f + 1);
+    fs.spec.packet_bytes = 512;
+    fs.spec.message_bytes = 512;
+    fs.spec.traffic.rate_gbps = w.offered_gbps / w.active;
+    fs.spec.active = on[static_cast<std::size_t>(f)];
+    if (fs.spec.active.empty()) fs.spec.stop = 0;  // never selected
+    fs.queue = static_cast<std::uint32_t>(f % w.cores);
+    s.flows.push_back(fs);
+  }
+  SchemeOptions o = opt;
+  o.dctcp = false;
+  apply_scheme(s, scheme, o);
+  return s;
+}
+
 }  // namespace ceio::exp

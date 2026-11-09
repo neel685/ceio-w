@@ -20,11 +20,9 @@ CeioController::CeioController(Simulator& sim, nic::Nic& nic, const CeioConfig& 
     by_queue_[info.queue].push_back(info.id);
   }
   if (warm_variant()) {
-    for (const auto& [q, ids] : by_queue_) {
-      std::size_t cpu = 0;
-      for (net::FlowId id : ids) cpu += !flows_.at(id).info.rdma;
-      if (cpu > 1) throw std::invalid_argument("CEIO-W: one CPU-involved flow per receive queue");
-    }
+    for (const auto& [q, ids] : by_queue_)
+      for (net::FlowId id : ids)
+        if (!flows_.at(id).info.rdma) qcred_[q];  // credit state per queue, O(queues)
     w_recompute_targets();  // initial equal split, before the drivers' first refill
   }
 }
@@ -38,52 +36,53 @@ std::int64_t CeioController::upgrade_room(const Flow& f) const {
   return warm_variant() ? static_cast<std::int64_t>(nic_.queue(f.info.queue).posted()) : cm_.credits(f.info.id);
 }
 
-std::int64_t CeioController::allowance(net::FlowId id) const {
-  auto it = flows_.find(id);
-  if (it == flows_.end()) return 0;
+std::int64_t CeioController::allowance(nic::QueueId q) const {
+  auto it = qcred_.find(q);
+  if (it == qcred_.end()) return 0;
   return std::max<std::int64_t>(0, it->second.target - it->second.in_use);
 }
 
-std::int64_t CeioController::target(net::FlowId id) const {
-  auto it = flows_.find(id);
-  return it == flows_.end() ? 0 : it->second.target;
+std::int64_t CeioController::target(nic::QueueId q) const {
+  auto it = qcred_.find(q);
+  return it == qcred_.end() ? 0 : it->second.target;
 }
 
-void CeioController::on_posted(net::FlowId id, std::uint32_t n) {
-  Flow& f = flows_.at(id);
-  f.in_use += n;
+void CeioController::on_posted(nic::QueueId q, std::uint32_t n) {
+  qcred_.at(q).in_use += n;
+  note_footprint();
+}
+
+void CeioController::note_footprint() {
   std::int64_t total = 0;
-  for (const auto& [j, g] : flows_) total += g.in_use;
+  for (const auto& [q, c] : qcred_) total += c.in_use;
+  for (const auto& [id, f] : flows_) total += f.in_use;
   stats_.w_max_in_use = std::max(stats_.w_max_in_use, total);
 }
 
-std::optional<net::FlowId> CeioController::descriptor_flow(nic::QueueId q) const {
-  auto it = by_queue_.find(q);
-  if (it == by_queue_.end()) return std::nullopt;
-  for (net::FlowId id : it->second)
-    if (!flows_.at(id).info.rdma) return id;
-  return std::nullopt;
+void CeioController::divert_to_slow(Flow& f, net::Packet p) {
+  p.slow = true;
+  f.nic_mem.push_back(p);
+  f.nic_mem_bytes += p.bytes;
+  nic_mem_used_ += p.bytes;
+  ++stats_.slow_packets;
+  ++f.slow_total;
 }
 
 void CeioController::w_recompute_targets() {
   // Adaptive allocation: demands from recent consumption, water-filled under the budget.
-  std::vector<Flow*> cpu;
-  for (auto& [id, f] : flows_) {
-    if (f.info.rdma) {
-      f.target = cfg_.w_bulk_credits;
-    } else {
-      cpu.push_back(&f);
-    }
-  }
+  for (auto& [id, f] : flows_)
+    if (f.info.rdma) f.target = cfg_.w_bulk_credits;
+  std::vector<QueueCredits*> cpu;
+  for (auto& [q, c] : qcred_) cpu.push_back(&c);
   if (cpu.empty()) return;
   const auto n = static_cast<std::int64_t>(cpu.size());
   if (!cfg_.w_adaptive_alloc) {
-    for (Flow* f : cpu) f->target = std::max(cfg_.w_min_target, budget_ / n);
+    for (QueueCredits* f : cpu) f->target = std::max(cfg_.w_min_target, budget_ / n);
     return;
   }
   std::vector<double> demand;
   double total = 0;
-  for (Flow* f : cpu) {
+  for (QueueCredits* f : cpu) {
     const double d = std::max(static_cast<double>(cfg_.w_min_target), cfg_.w_k * f->batch_ewma);
     demand.push_back(d);
     total += d;
@@ -114,8 +113,7 @@ void CeioController::w_budget_loop() {
   seen_hits_ = hits;
   seen_misses_ = misses;
   if (dh + dm >= 100) {
-    std::int64_t n_cpu = 0;
-    for (const auto& [id, f] : flows_) n_cpu += !f.info.rdma;
+    const auto n_cpu = static_cast<std::int64_t>(qcred_.size());
     const std::int64_t floor = cfg_.w_min_target * std::max<std::int64_t>(n_cpu, 1);
     const double miss = static_cast<double>(dm) / static_cast<double>(dh + dm);
     if (miss > cfg_.w_miss_target) {
@@ -306,18 +304,18 @@ void CeioController::on_steer(const net::Packet& p, nic::SteeringRule& rule) {
     if (f.info.rdma) {
       if (f.in_use >= f.target) return set_mode(f, Mode::kSlow);
       ++f.in_use;
+      note_footprint();
     } else if (nic_.queue(f.info.queue).posted() == 0) {
       // Ring-as-credit: an empty ring is the (exact) out-of-credits signal. Packets still
       // waiting on-chip for a descriptor are older than this one: move them to
-      // on-NIC memory first so the slow path keeps arrival order.
+      // their flows' on-NIC memory first (switching those flows to the slow path
+      // too) so every flow keeps arrival order.
       set_mode(f, Mode::kSlow);
       for (net::Packet& w : nic_.reclaim_waiting(f.info.queue)) {
-        w.slow = true;
-        f.nic_mem.push_back(w);
-        f.nic_mem_bytes += w.bytes;
-        nic_mem_used_ += w.bytes;
-        ++stats_.slow_packets;
-        ++f.slow_total;
+        auto owner = flows_.find(w.flow);
+        if (owner == flows_.end()) continue;
+        if (owner->second.mode == Mode::kFast && !owner->second.paused) set_mode(owner->second, Mode::kSlow);
+        divert_to_slow(owner->second, w);
       }
       return;
     }
@@ -549,9 +547,14 @@ void CeioController::on_processed(host::CpuCore&, const nic::RxCompletion& c) {
   if (it == flows_.end()) return;
   if (warm_variant()) {
     Flow& f = it->second;
-    f.in_use -= c.fast_pkts;  // host-side credits: released as soon as the buffer is done
-    ++f.batch_count;
-    if (f.info.rdma) update_mode(f);
+    if (f.info.rdma) {
+      f.in_use -= c.fast_pkts;  // host-side credits: released as soon as the data is done
+      update_mode(f);
+    } else {
+      QueueCredits& qc = qcred_.at(f.info.queue);
+      qc.in_use -= c.fast_pkts;
+      ++qc.batch_count;
+    }
     return;
   }
   if (c.fast_pkts > 0) unreleased_[c.pkt.flow] += c.fast_pkts;
@@ -561,10 +564,10 @@ void CeioController::on_batch_end(host::CpuCore& core) {
   auto it = by_queue_.find(core.queue());
   if (it == by_queue_.end()) return;
   if (warm_variant()) {
-    for (net::FlowId id : it->second) {
-      Flow& f = flows_.at(id);
-      f.batch_ewma = 0.8 * f.batch_ewma + 0.2 * static_cast<double>(f.batch_count);
-      f.batch_count = 0;
+    auto qc = qcred_.find(core.queue());
+    if (qc != qcred_.end()) {
+      qc->second.batch_ewma = 0.8 * qc->second.batch_ewma + 0.2 * static_cast<double>(qc->second.batch_count);
+      qc->second.batch_count = 0;
     }
     return;
   }
